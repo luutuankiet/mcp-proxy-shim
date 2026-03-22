@@ -1,6 +1,6 @@
 {
   "name": "@luutuankiet/mcp-proxy-shim",
-  "version": "1.1.0",
+  "version": "1.0.8",
   "description": "MCP proxy shim for mcpproxy-go — transforms call_tool_* args_json:string to native args:object. Supports stdio and HTTP Streamable transports.",
   "type": "module",
   "main": "dist/index.js",
