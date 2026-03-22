@@ -433,9 +433,11 @@ function compactRetrieveTools(
     ? result
     : (result && Array.isArray(result.tools) ? result.tools as unknown[] : undefined);
 
+  let wasCompacted = false;
   if (compact && tools) {
     const fullJson = JSON.stringify(tools);
     if (fullJson.length > 5000) {
+      wasCompacted = true;
       tools = tools.map((t: unknown) => {
         const tool = t as Record<string, unknown>;
         return {
@@ -457,7 +459,14 @@ function compactRetrieveTools(
   if (Array.isArray(result)) {
     output = tools || result;
   } else if (result && typeof result === "object" && tools) {
-    output = { ...result, tools };
+    output = {
+      ...result,
+      tools,
+      // When compacted, tell the agent how to get full schemas
+      ...(wasCompacted ? {
+        note: "Results are compacted (inputSchema stripped). Before calling a tool, use describe_tools({names: [tool.name]}) to get the full inputSchema and avoid parameter errors.",
+      } : {}),
+    };
   } else {
     output = unwrapped;
   }
