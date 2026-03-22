@@ -1,6 +1,6 @@
 # @luutuankiet/mcp-proxy-shim
 
-**Stdio MCP shim for [mcpproxy-go](https://github.com/smart-mcp-proxy/mcpproxy-go)** — eliminates `args_json` string escaping overhead for LLM clients.
+**MCP shim for [mcpproxy-go](https://github.com/smart-mcp-proxy/mcpproxy-go)** — eliminates `args_json` string escaping overhead for LLM clients. Supports **stdio** and **HTTP Streamable** transports.
 
 ## The Problem
 
@@ -21,7 +21,7 @@ mcpproxy-go's `/mcp/call` mode uses **generic dispatcher tools** (`call_tool_rea
 The LLM must escape every quote, every nested object, every bracket. For complex tool calls (file edits with match_text containing code), this becomes:
 
 ```json
-"args_json": "{\"files\":[{\"path\":\"src/app.ts\",\"edits\":[{\"match_text\":\"function hello() {\\n  return \\\"world\\\";\\n}\",\"new_string\":\"function hello() {\\n  return \\\"universe\\\";\\n}\"}]}]}"
+"args_json": "{\"files\":[{\"path\":\"src/app.ts\",\"edits\":[{\"match_text\":\"function hello() {\\n  return \\\\\"world\\\\\";\\n}\",\"new_string\":\"function hello() {\\n  return \\\\\"universe\\\\\";\\n}\"}]}]}"
 ```
 
 This is **~400 tokens of overhead per call**, and LLMs frequently produce malformed payloads (mismatched escaping, missing backslashes).
@@ -56,11 +56,11 @@ Native JSON. No escaping. ~50 tokens. Zero malformed payloads.
 ```mermaid
 sequenceDiagram
     participant Client as MCP Client<br/>Claude Code / Cursor / etc
-    participant Shim as mcp-proxy-shim<br/>stdio
+    participant Shim as mcp-proxy-shim<br/>stdio or HTTP
     participant Proxy as mcpproxy-go<br/>StreamableHTTP
 
     Note over Client,Proxy: Connection Setup
-    Client->>Shim: initialize (stdio)
+    Client->>Shim: initialize (stdio or HTTP)
     Shim->>Proxy: initialize (HTTP)
     Proxy-->>Shim: capabilities + session ID
     Shim-->>Client: capabilities
@@ -97,6 +97,8 @@ Only 3 tools are transformed. **Everything else passes through unchanged:**
 
 ## Quick Start
 
+### Option A: Stdio (local MCP client)
+
 Add to your `.mcp.json` — no install needed, `npx` fetches on first run:
 
 ```json
@@ -119,19 +121,95 @@ Or run directly from the CLI:
 MCP_URL="https://your-proxy/mcp/?apikey=KEY" npx @luutuankiet/mcp-proxy-shim
 ```
 
+### Option B: HTTP Streamable Server (remote agents)
+
+Run as an HTTP server that remote MCP clients connect to over the network:
+
+```bash
+MCP_URL="https://upstream-proxy/mcp/?apikey=KEY" \
+  MCP_APIKEY="my-secret" \
+  npx @luutuankiet/mcp-proxy-shim serve
+```
+
+Then point your remote MCP client at:
+```
+http://localhost:3000/mcp?apikey=my-secret
+```
+
+#### Production deployment with Docker
+
+```yaml
+# docker-compose.yml
+services:
+  mcp-shim:
+    image: node:22-slim
+    command: npx -y @luutuankiet/mcp-proxy-shim serve
+    environment:
+      - MCP_URL=http://mcpproxy:9997/mcp/?apikey=admin
+      - MCP_PORT=3000
+      - MCP_HOST=0.0.0.0
+      - MCP_APIKEY=your-secret-key
+    ports:
+      - "3000:3000"
+```
+
+Put a reverse proxy (Caddy/nginx/Traefik) in front for TLS:
+```
+https://shim.yourdomain.com/mcp?apikey=KEY  →  http://localhost:3000/mcp
+```
+
+#### HTTP Server Architecture
+
+```mermaid
+sequenceDiagram
+    participant Agent as Remote Agent
+    participant Shim as mcp-proxy-shim<br/>HTTP :3000
+    participant Proxy as mcpproxy-go<br/>upstream
+
+    Note over Agent,Shim: Authentication
+    Agent->>Shim: POST /mcp?apikey=KEY
+    alt apikey invalid or missing
+        Shim-->>Agent: 401 Unauthorized
+    else apikey valid
+        Note over Shim: Create session transport
+        Shim->>Proxy: initialize shared upstream
+        Proxy-->>Shim: session ID
+        Shim-->>Agent: MCP session + Mcp-Session-Id header
+    end
+
+    Note over Agent,Shim: Subsequent requests
+    Agent->>Shim: POST /mcp?apikey=KEY<br/>Mcp-Session-Id: abc-123
+    Shim->>Proxy: tool call shared session
+    Proxy-->>Shim: result
+    Shim-->>Agent: result
+
+    Note over Shim: Multiple agents share<br/>one upstream connection
+```
+
+Each downstream client gets its own MCP session, but all sessions **share a single upstream connection** to mcpproxy-go. This is efficient — one upstream session, many downstream clients.
+
+**Endpoints:**
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/mcp` | POST | `?apikey=` | MCP JSON-RPC (initialize, tool calls) |
+| `/mcp` | GET | `?apikey=` | SSE stream reconnection |
+| `/mcp` | DELETE | `?apikey=` | Session termination |
+| `/health` | GET | None | Health check (session count, uptime) |
+
 ## Why Not `/mcp/all`?
 
 mcpproxy-go exposes two routing modes:
 
 ```mermaid
 flowchart LR
-    subgraph "/mcp/all (direct mode)"
+    subgraph direct["/mcp/all - direct mode"]
         A1[Client] --> B1[myserver__read_files<br/>native schema]
         A1 --> C1[myserver__edit_files<br/>native schema]
         A1 --> D1[github__get_user<br/>native schema]
     end
 
-    subgraph "/mcp/call (retrieve_tools mode)"
+    subgraph call["/mcp/call - retrieve_tools mode"]
         A2[Client] --> B2[retrieve_tools<br/>BM25 search]
         A2 --> C2[call_tool_read<br/>generic dispatcher]
         A2 --> D2[upstream_servers<br/>add/remove/patch]
@@ -150,25 +228,38 @@ We tested this live: added a YNAB financial tool mid-session → 43 new tools ap
 # 1. User adds YNAB server to mcpproxy-go (via UI or API)
 
 # 2. Client discovers new tools (no reconnect!)
-→ retrieve_tools("ynab accounts balance")
-← [ynab__getAccounts, ynab__getTransactions, ynab__getPlans, ...]
+# retrieve_tools("ynab accounts balance")
+# => [ynab__getAccounts, ynab__getTransactions, ynab__getPlans, ...]
 
 # 3. Client calls with native args (shim handles serialization)
-→ call_tool_read {
-    name: "utils:ynab__getAccounts",
-    args: { plan_id: "abc-123" }  // ← native object, not escaped string
-  }
-← [{ name: "Checking", balance: 1500000, ... }]
+# call_tool_read {
+#     name: "utils:ynab__getAccounts",
+#     args: { plan_id: "abc-123" }  // native object, not escaped string
+#   }
+# => [{ name: "Checking", balance: 1500000, ... }]
 ```
 
 ## Configuration
 
-| Environment variable | Default | Description |
-|---------------------|---------|-------------|
-| `MCP_URL` | **(required)** | mcpproxy-go StreamableHTTP endpoint |
-| `https_proxy` / `HTTPS_PROXY` | — | HTTPS proxy (auto-detected via undici ProxyAgent) |
+| Environment variable | Default | Transport | Description |
+|---------------------|---------|-----------|-------------|
+| `MCP_URL` | **(required)** | Both | mcpproxy-go StreamableHTTP endpoint |
+| `MCP_PORT` | `3000` | HTTP only | Port to listen on |
+| `MCP_HOST` | `0.0.0.0` | HTTP only | Host to bind to |
+| `MCP_APIKEY` | — (open) | HTTP only | API key for downstream clients. When set, requests must include `?apikey=KEY`. Unset = no auth. |
+| `https_proxy` / `HTTPS_PROXY` | — | Both | HTTPS proxy (auto-detected via undici ProxyAgent) |
 
 ## Architecture Details
+
+### Transport Modes
+
+| Feature | Stdio | HTTP Streamable (`serve`) |
+|---------|-------|--------------------------|
+| Use case | Local MCP client (Claude Code, Cursor) | Remote agents, cloud sandboxes |
+| Connection | stdin/stdout | HTTP POST/GET/DELETE on `/mcp` |
+| Auth | N/A (local process) | Optional `?apikey=` query param |
+| Multi-client | Single client | Multiple concurrent sessions |
+| Upstream sharing | One-to-one | Many-to-one (shared upstream) |
 
 ### Session Management
 
@@ -176,15 +267,15 @@ We tested this live: added a YNAB financial tool mid-session → 43 new tools ap
 - Auto-reinitializes on session expiry (e.g., upstream restart, 405 responses)
 - Retries transient failures with exponential backoff (1s, 2s, max 2 retries)
 - Refreshes tool list on every `tools/list` request (upstream servers may have changed)
+- HTTP mode: each downstream client gets its own `Mcp-Session-Id`, all sharing one upstream session
 
 ### Backward Compatibility
 
 If a caller sends `args_json` directly (old style), the shim **passes it through unchanged**. You can migrate gradually — no breaking changes.
 
 ```json
-// Both work:
-{ "args": { "files": [...] } }         // ← new: native object (shim serializes)
-{ "args_json": "{\"files\":[...]}" }    // ← old: pre-serialized (shim passes through)
+{ "args": { "files": [...] } }         // new: native object (shim serializes)
+{ "args_json": "{\"files\":[...]}" }    // old: pre-serialized (shim passes through)
 ```
 
 ### HTTPS Proxy Support
@@ -206,19 +297,29 @@ StreamableHTTP responses may arrive as either `application/json` or `text/event-
 ## Development
 
 ```bash
-git clone https://github.com/luutuankiet/sandbox-cc
-cd sandbox-cc/mcp-shim
+git clone https://github.com/luutuankiet/mcp-proxy-shim
+cd mcp-proxy-shim
 npm install
 npm run build
-npm start       # starts the shim (connects upstream, waits for stdio)
+npm start         # stdio mode (connects upstream, waits for stdio)
+npm run start:http  # HTTP serve mode
 ```
 
 ### Testing
 
 ```bash
-# Send MCP JSON-RPC over stdin:
+# Stdio mode — send MCP JSON-RPC over stdin:
 echo '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}' \
   | MCP_URL="https://your-proxy/mcp/?apikey=KEY" node dist/index.js
+
+# HTTP mode — start server, then test with curl:
+MCP_URL="https://your-proxy/mcp/?apikey=KEY" MCP_APIKEY="test" node dist/index.js serve
+
+# In another terminal:
+curl http://localhost:3000/health
+curl -X POST http://localhost:3000/mcp?apikey=test \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}'
 ```
 
 Logs go to stderr (stdout is the stdio transport):
