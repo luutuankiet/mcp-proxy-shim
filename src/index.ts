@@ -64,6 +64,39 @@ const CALL_TOOL_NAMES = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
+// Shim-local tools (not forwarded upstream)
+// ---------------------------------------------------------------------------
+
+/**
+ * describe_tools — batch-hydrate compact retrieve_tools results.
+ *
+ * Workflow: retrieve_tools (compact) → scan names → describe_tools (full schemas)
+ * Zero network cost — reads from cached upstream tool list.
+ *
+ * Named for Claude Code lazy-load discovery: an agent that only sees the tool
+ * name should immediately understand "this gives me full tool descriptions".
+ */
+const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
+  name: "describe_tools",
+  description:
+    "Get full schemas for specific tools by name. Use after retrieve_tools to hydrate " +
+    "compact results with complete inputSchema and descriptions. Accepts multiple tool " +
+    "names for token-efficient batch lookup.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      names: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Tool names to describe — use the 'name' field from retrieve_tools results",
+      },
+    },
+    required: ["names"],
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Upstream MCP session (manual HTTP — avoids SDK client bugs)
 // ---------------------------------------------------------------------------
 
@@ -499,12 +532,53 @@ async function main() {
       if (!cachedTools) throw err;
     }
 
-    return { tools: cachedTools.map(transformToolSchema) };
+    return {
+      tools: [
+        ...cachedTools.map(transformToolSchema),
+        DESCRIBE_TOOLS_SCHEMA, // shim-local: always present
+      ],
+    };
   });
 
   // Handle tools/call — transform args and forward upstream
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+
+    // --- Shim-local: describe_tools (no upstream call) ---
+    if (name === "describe_tools") {
+      const names = (args?.names ?? []) as string[];
+      if (!Array.isArray(names) || names.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: "names array is required" }) }],
+          isError: true,
+        };
+      }
+
+      // Refresh cache to reflect current upstream state
+      try {
+        cachedTools = await fetchUpstreamTools();
+      } catch (err) {
+        log("Tool refresh failed for describe_tools, using cached:", (err as Error).message);
+        if (!cachedTools) throw err;
+      }
+
+      // Build name→tool index for O(1) lookup
+      const index = new Map<string, ToolSchema>();
+      for (const tool of cachedTools) {
+        index.set(tool.name, tool);
+      }
+
+      // Look up each requested tool — return full schema (with transform applied)
+      const results = names.map((n) => {
+        const tool = index.get(n);
+        if (!tool) return { name: n, error: "not found" };
+        return transformToolSchema(tool);
+      });
+
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(results) }],
+      };
+    }
 
     const forwardArgs = transformToolCallArgs(name, args || {});
 
