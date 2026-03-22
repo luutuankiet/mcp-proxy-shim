@@ -51,8 +51,19 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           npm version "$VERSION" --no-git-tag-version
+      - name: Determine npm dist-tag
+        id: dist-tag
+        run: |
+          TAG="${GITHUB_REF_NAME:-manual}"
+          if [[ "$TAG" =~ -dev\. ]]; then
+            echo "tag=dev" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG" =~ -(rc|beta|alpha)\. ]]; then
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish to npm (OIDC provenance)
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag ${{ steps.dist-tag.outputs.tag }}
 
   preview:
     name: Preview (pkg-pr-new)

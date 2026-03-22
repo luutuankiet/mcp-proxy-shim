@@ -23,7 +23,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/luutuankiet/mcp-proxy-shim"
+    "url": "git+https://github.com/luutuankiet/mcp-proxy-shim.git"
   },
   "homepage": "https://github.com/luutuankiet/mcp-proxy-shim#readme",
   "bugs": {
