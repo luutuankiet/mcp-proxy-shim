@@ -1,11 +1,12 @@
 {
   "name": "@luutuankiet/mcp-proxy-shim",
-  "version": "1.0.6",
-  "description": "Stdio MCP shim for mcpproxy-go — transforms call_tool_* args_json:string to native args:object, eliminating ~400 tokens of JSON escaping overhead per LLM tool call",
+  "version": "1.1.0",
+  "description": "MCP proxy shim for mcpproxy-go — transforms call_tool_* args_json:string to native args:object. Supports stdio and HTTP Streamable transports.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "mcp-proxy-shim": "dist/index.js"
+    "mcp-proxy-shim": "dist/index.js",
+    "mcp-proxy-shim-http": "dist/http-server.js"
   },
   "files": [
     "dist",
@@ -14,7 +15,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:http": "node dist/http-server.js",
     "dev": "npx tsx src/index.ts",
+    "dev:http": "npx tsx src/http-server.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -23,6 +26,8 @@
     "proxy",
     "shim",
     "stdio",
+    "http",
+    "streamable-http",
     "model-context-protocol",
     "args-json",
     "schema-transform",
