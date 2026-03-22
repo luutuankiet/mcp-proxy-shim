@@ -34,6 +34,7 @@ if (subcommand === "--help" || subcommand === "-h") {
   console.log("  MCP_URL       (required) upstream mcpproxy-go endpoint");
   console.log("  MCP_PORT      (serve only) port to listen on (default: 3000)");
   console.log("  MCP_HOST      (serve only) host to bind to (default: 0.0.0.0)");
+  console.log("  MCP_APIKEY    (serve only) require ?apikey=KEY on /mcp requests");
   console.log("  https_proxy   HTTPS proxy for upstream connection");
   process.exit(0);
 }

@@ -16,6 +16,8 @@
  *   MCP_URL      (required)  Upstream mcpproxy-go StreamableHTTP endpoint
  *   MCP_PORT     (optional)  Port to listen on (default: 3000)
  *   MCP_HOST     (optional)  Host to bind to (default: 0.0.0.0)
+ *   MCP_APIKEY   (optional)  API key for downstream clients. When set, requests
+ *                            must include ?apikey=KEY in the URL. Unset = open.
  *   https_proxy  (optional)  HTTPS proxy for upstream connection
  *
  * Usage:
@@ -36,6 +38,7 @@ import { createShimServer, log, maskUrl, UPSTREAM_URL } from "./core.js";
 
 const PORT = parseInt(process.env.MCP_PORT || "3000", 10);
 const HOST = process.env.MCP_HOST || "0.0.0.0";
+const APIKEY = process.env.MCP_APIKEY || null;
 
 // ---------------------------------------------------------------------------
 // Session management
@@ -179,11 +182,22 @@ async function handleMcpRequest(
 async function main() {
   log(`Starting HTTP Streamable server on ${HOST}:${PORT}`);
   log(`Upstream: ${maskUrl(UPSTREAM_URL)}`);
+  log(`Auth: ${APIKEY ? "apikey required (?apikey=...)" : "OPEN (no MCP_APIKEY set)"}`);
 
   const httpServer = http.createServer((req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     if (url.pathname === "/mcp" || url.pathname === "/mcp/") {
+      // Apikey gate — reject early if MCP_APIKEY is set and key doesn't match
+      if (APIKEY && url.searchParams.get("apikey") !== APIKEY) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Unauthorized: invalid or missing apikey" },
+          id: null,
+        }));
+        return;
+      }
       handleMcpRequest(req, res).catch((err) => {
         log("Unhandled error in MCP handler:", (err as Error).message);
         if (!res.headersSent) {
