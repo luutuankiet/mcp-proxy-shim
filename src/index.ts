@@ -314,6 +314,125 @@ function transformToolCallArgs(
 }
 
 // ---------------------------------------------------------------------------
+// Response unwrapping (deep, recursive)
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect MCP content wrapper shape: {content: [{type: "text", text: "..."}]}
+ */
+function isMcpContentWrapper(obj: unknown): obj is { content: Array<{ type: string; text: string }> } {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  const o = obj as Record<string, unknown>;
+  if (!Array.isArray(o.content) || o.content.length === 0) return false;
+  const first = o.content[0] as Record<string, unknown>;
+  return first?.type === "text" && typeof first?.text === "string";
+}
+
+/**
+ * Recursively unwrap a single text value.
+ * Keeps parsing until it's no longer a JSON string or an MCP content wrapper.
+ */
+function deepParseText(text: string, maxDepth = 5): unknown {
+  let value: unknown = text;
+  let depth = 0;
+  while (typeof value === "string" && depth < maxDepth) {
+    try {
+      const parsed = JSON.parse(value);
+      if (isMcpContentWrapper(parsed)) {
+        if (parsed.content.length === 1) {
+          value = parsed.content[0].text;
+          depth++;
+          continue;
+        }
+        return parsed.content.map((c: { type: string; text: string }) =>
+          c.type === "text" ? deepParseText(c.text, maxDepth - depth - 1) : c,
+        );
+      }
+      return parsed;
+    } catch {
+      break;
+    }
+  }
+  return value;
+}
+
+/**
+ * Unwrap an MCP result object to its deepest payload.
+ */
+function deepUnwrapResult(result: unknown): unknown {
+  if (!isMcpContentWrapper(result)) return result;
+  if (result.content.length === 1) {
+    return deepParseText(result.content[0].text);
+  }
+  return result.content.map((c: { type: string; text: string }) =>
+    c.type === "text" ? deepParseText(c.text) : c,
+  );
+}
+
+/**
+ * Unwrap then re-wrap for MCP protocol compliance.
+ * The shim must return valid {content: [{type: "text", text: "..."}]} to Claude.
+ */
+function unwrapAndRewrap(result: unknown): { content: Array<{ type: "text"; text: string }> } {
+  const unwrapped = deepUnwrapResult(result);
+  // If it's already a content wrapper with no further nesting, return as-is
+  if (isMcpContentWrapper(unwrapped)) {
+    return unwrapped as { content: Array<{ type: "text"; text: string }> };
+  }
+  const text = typeof unwrapped === "string" ? unwrapped : JSON.stringify(unwrapped);
+  return { content: [{ type: "text", text }] };
+}
+
+/**
+ * Smart compaction for retrieve_tools responses.
+ * When payload > 5KB and compact !== false, strip inputSchema to save tokens.
+ */
+function compactRetrieveTools(
+  unwrapped: unknown,
+  args: Record<string, unknown>,
+): { content: Array<{ type: "text"; text: string }> } {
+  const compact = args.compact !== false; // default true
+  const limit = typeof args.limit === "number" ? args.limit : 0;
+
+  let result = unwrapped as Record<string, unknown>;
+  // retrieve_tools may return {query, tools[], total} or a raw array
+  let tools: unknown[] | undefined = Array.isArray(result)
+    ? result
+    : (result && Array.isArray(result.tools) ? result.tools as unknown[] : undefined);
+
+  if (compact && tools) {
+    const fullJson = JSON.stringify(tools);
+    if (fullJson.length > 5000) {
+      tools = tools.map((t: unknown) => {
+        const tool = t as Record<string, unknown>;
+        return {
+          server: tool.server,
+          name: tool.name,
+          call_with: tool.call_with,
+          description: typeof tool.description === "string"
+            ? tool.description.slice(0, 100) + (tool.description.length > 100 ? "..." : "")
+            : undefined,
+        };
+      });
+    }
+  }
+  if (limit > 0 && tools) {
+    tools = tools.slice(0, limit);
+  }
+  // Reconstruct the result with compacted tools
+  let output: unknown;
+  if (Array.isArray(result)) {
+    output = tools || result;
+  } else if (result && typeof result === "object" && tools) {
+    output = { ...result, tools };
+  } else {
+    output = unwrapped;
+  }
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+  return { content: [{ type: "text", text }] };
+}
+
+// ---------------------------------------------------------------------------
 // Upstream tool list (cached, refreshed on tools/list)
 // ---------------------------------------------------------------------------
 
@@ -419,7 +538,10 @@ async function main() {
               arguments: forwardArgs,
             });
             if (retry && !retry.error) {
-              return retry.result as { content: Array<{ type: string; text: string }> };
+              if (name === "retrieve_tools") {
+                return compactRetrieveTools(deepUnwrapResult(retry.result), args || {});
+              }
+              return unwrapAndRewrap(retry.result);
             }
           }
         }
@@ -435,8 +557,11 @@ async function main() {
         };
       }
 
-      // Return the result as-is — it's already in MCP content format
-      return resp.result as { content: Array<{ type: string; text: string }> };
+      // Deep unwrap + re-wrap for clean responses
+      if (name === "retrieve_tools") {
+        return compactRetrieveTools(deepUnwrapResult(resp.result), args || {});
+      }
+      return unwrapAndRewrap(resp.result);
     } catch (err) {
       const msg = (err as Error).message;
       log("Tool call error:", name, msg);
