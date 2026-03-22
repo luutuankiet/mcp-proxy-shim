@@ -1,0 +1,56 @@
+{
+  "name": "@luutuankiet/mcp-proxy-shim",
+  "version": "1.0.0",
+  "description": "Stdio MCP shim for mcpproxy-go — transforms call_tool_* args_json:string to native args:object, eliminating ~400 tokens of JSON escaping overhead per LLM tool call",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-proxy-shim": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "npx tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "mcpproxy-go",
+    "proxy",
+    "shim",
+    "stdio",
+    "model-context-protocol",
+    "args-json",
+    "schema-transform",
+    "claude",
+    "llm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luutuankiet/sandbox-cc",
+    "directory": "plugins/mcp-shim"
+  },
+  "homepage": "https://github.com/luutuankiet/sandbox-cc/tree/main/plugins/mcp-shim#readme",
+  "bugs": {
+    "url": "https://github.com/luutuankiet/sandbox-cc/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "undici": "^7.24.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
