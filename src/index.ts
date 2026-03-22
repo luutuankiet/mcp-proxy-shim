@@ -64,6 +64,39 @@ const CALL_TOOL_NAMES = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
+// Shim-local tools (not forwarded upstream)
+// ---------------------------------------------------------------------------
+
+/**
+ * describe_tools — batch-hydrate compact retrieve_tools results.
+ *
+ * Workflow: retrieve_tools (compact) → scan names → describe_tools (full schemas)
+ * Zero network cost — reads from cached upstream tool list.
+ *
+ * Named for Claude Code lazy-load discovery: an agent that only sees the tool
+ * name should immediately understand "this gives me full tool descriptions".
+ */
+const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
+  name: "describe_tools",
+  description:
+    "Get full schemas for specific tools by name. Use after retrieve_tools to hydrate " +
+    "compact results with complete inputSchema and descriptions. Accepts multiple tool " +
+    "names for token-efficient batch lookup.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      names: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Tool names to describe — use the 'name' field from retrieve_tools results",
+      },
+    },
+    required: ["names"],
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Upstream MCP session (manual HTTP — avoids SDK client bugs)
 // ---------------------------------------------------------------------------
 
@@ -314,6 +347,134 @@ function transformToolCallArgs(
 }
 
 // ---------------------------------------------------------------------------
+// Response unwrapping (deep, recursive)
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect MCP content wrapper shape: {content: [{type: "text", text: "..."}]}
+ */
+function isMcpContentWrapper(obj: unknown): obj is { content: Array<{ type: string; text: string }> } {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  const o = obj as Record<string, unknown>;
+  if (!Array.isArray(o.content) || o.content.length === 0) return false;
+  const first = o.content[0] as Record<string, unknown>;
+  return first?.type === "text" && typeof first?.text === "string";
+}
+
+/**
+ * Recursively unwrap a single text value.
+ * Keeps parsing until it's no longer a JSON string or an MCP content wrapper.
+ */
+function deepParseText(text: string, maxDepth = 5): unknown {
+  let value: unknown = text;
+  let depth = 0;
+  while (typeof value === "string" && depth < maxDepth) {
+    try {
+      const parsed = JSON.parse(value);
+      if (isMcpContentWrapper(parsed)) {
+        if (parsed.content.length === 1) {
+          value = parsed.content[0].text;
+          depth++;
+          continue;
+        }
+        return parsed.content.map((c: { type: string; text: string }) =>
+          c.type === "text" ? deepParseText(c.text, maxDepth - depth - 1) : c,
+        );
+      }
+      return parsed;
+    } catch {
+      break;
+    }
+  }
+  return value;
+}
+
+/**
+ * Unwrap an MCP result object to its deepest payload.
+ */
+function deepUnwrapResult(result: unknown): unknown {
+  if (!isMcpContentWrapper(result)) return result;
+  if (result.content.length === 1) {
+    return deepParseText(result.content[0].text);
+  }
+  return result.content.map((c: { type: string; text: string }) =>
+    c.type === "text" ? deepParseText(c.text) : c,
+  );
+}
+
+/**
+ * Unwrap then re-wrap for MCP protocol compliance.
+ * The shim must return valid {content: [{type: "text", text: "..."}]} to Claude.
+ */
+function unwrapAndRewrap(result: unknown): { content: Array<{ type: "text"; text: string }> } {
+  const unwrapped = deepUnwrapResult(result);
+  // If it's already a content wrapper with no further nesting, return as-is
+  if (isMcpContentWrapper(unwrapped)) {
+    return unwrapped as { content: Array<{ type: "text"; text: string }> };
+  }
+  const text = typeof unwrapped === "string" ? unwrapped : JSON.stringify(unwrapped);
+  return { content: [{ type: "text", text }] };
+}
+
+/**
+ * Smart compaction for retrieve_tools responses.
+ * When payload > 5KB and compact !== false, strip inputSchema to save tokens.
+ */
+function compactRetrieveTools(
+  unwrapped: unknown,
+  args: Record<string, unknown>,
+): { content: Array<{ type: "text"; text: string }> } {
+  const compact = args.compact !== false; // default true
+  const limit = typeof args.limit === "number" ? args.limit : 0;
+
+  let result = unwrapped as Record<string, unknown>;
+  // retrieve_tools may return {query, tools[], total} or a raw array
+  let tools: unknown[] | undefined = Array.isArray(result)
+    ? result
+    : (result && Array.isArray(result.tools) ? result.tools as unknown[] : undefined);
+
+  let wasCompacted = false;
+  if (compact && tools) {
+    const fullJson = JSON.stringify(tools);
+    if (fullJson.length > 5000) {
+      wasCompacted = true;
+      tools = tools.map((t: unknown) => {
+        const tool = t as Record<string, unknown>;
+        return {
+          server: tool.server,
+          name: tool.name,
+          call_with: tool.call_with,
+          description: typeof tool.description === "string"
+            ? tool.description.slice(0, 100) + (tool.description.length > 100 ? "..." : "")
+            : undefined,
+        };
+      });
+    }
+  }
+  if (limit > 0 && tools) {
+    tools = tools.slice(0, limit);
+  }
+  // Reconstruct the result with compacted tools
+  let output: unknown;
+  if (Array.isArray(result)) {
+    output = tools || result;
+  } else if (result && typeof result === "object" && tools) {
+    output = {
+      ...result,
+      tools,
+      // When compacted, tell the agent how to get full schemas
+      ...(wasCompacted ? {
+        note: "Results are compacted (inputSchema stripped). Before calling a tool, use describe_tools({names: [tool.name]}) to get the full inputSchema and avoid parameter errors.",
+      } : {}),
+    };
+  } else {
+    output = unwrapped;
+  }
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+  return { content: [{ type: "text", text }] };
+}
+
+// ---------------------------------------------------------------------------
 // Upstream tool list (cached, refreshed on tools/list)
 // ---------------------------------------------------------------------------
 
@@ -380,12 +541,88 @@ async function main() {
       if (!cachedTools) throw err;
     }
 
-    return { tools: cachedTools.map(transformToolSchema) };
+    return {
+      tools: [
+        ...cachedTools.map(transformToolSchema),
+        DESCRIBE_TOOLS_SCHEMA, // shim-local: always present
+      ],
+    };
   });
 
   // Handle tools/call — transform args and forward upstream
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+
+    // --- Shim-local: describe_tools ---
+    // Hydrates compact retrieve_tools results with full schemas.
+    // Must query upstream retrieve_tools (not tools/list) because remote tools
+    // like "github__create_or_update_file" are only in the upstream search index.
+    if (name === "describe_tools") {
+      const names = (args?.names ?? []) as string[];
+      if (!Array.isArray(names) || names.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: "names array is required" }) }],
+          isError: true,
+        };
+      }
+
+      await ensureSession();
+
+      // Derive BM25 search queries from tool names.
+      // e.g. "github__create_or_update_file" → "create or update file"
+      const nameSet = new Set(names);
+      const queries = new Set<string>();
+      for (const n of nameSet) {
+        const parts = n.split("__");
+        const toolPart = parts[parts.length - 1] || n;
+        queries.add(toolPart.replace(/_/g, " "));
+      }
+
+      // Fetch full tool entries from upstream (no compaction applied)
+      const index = new Map<string, ToolSchema>();
+      for (const query of queries) {
+        try {
+          log("describe_tools: querying upstream retrieve_tools with:", query);
+          const resp = await mcpRequest("tools/call", {
+            name: "retrieve_tools",
+            arguments: { query },
+          });
+          log("describe_tools: resp exists:", !!resp, "resp.result exists:", !!resp?.result);
+          if (resp?.result) {
+            const unwrapped = deepUnwrapResult(resp.result);
+            log("describe_tools: unwrapped type:", typeof unwrapped, "isArray:", Array.isArray(unwrapped));
+            if (unwrapped && typeof unwrapped === "object" && !Array.isArray(unwrapped)) {
+              log("describe_tools: unwrapped keys:", Object.keys(unwrapped as Record<string, unknown>).join(", "));
+            }
+            const result = unwrapped as Record<string, unknown>;
+            const tools: unknown[] = Array.isArray(result)
+              ? result
+              : (result && Array.isArray(result.tools) ? result.tools as unknown[] : []);
+            log("describe_tools: found", tools.length, "tools from query");
+            for (const t of tools) {
+              const tool = t as ToolSchema;
+              if (tool.name && !index.has(tool.name)) {
+                index.set(tool.name, tool);
+              }
+            }
+          }
+        } catch (err) {
+          log("describe_tools query failed:", query, (err as Error).message);
+        }
+      }
+      log("describe_tools: index has", index.size, "tools, looking up:", names.join(", "));
+
+      // Look up each requested tool — return full schema (with transform applied)
+      const results = names.map((n) => {
+        const tool = index.get(n);
+        if (!tool) return { name: n, error: "not found" };
+        return transformToolSchema(tool);
+      });
+
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(results) }],
+      };
+    }
 
     const forwardArgs = transformToolCallArgs(name, args || {});
 
@@ -419,7 +656,10 @@ async function main() {
               arguments: forwardArgs,
             });
             if (retry && !retry.error) {
-              return retry.result as { content: Array<{ type: string; text: string }> };
+              if (name === "retrieve_tools") {
+                return compactRetrieveTools(deepUnwrapResult(retry.result), args || {});
+              }
+              return unwrapAndRewrap(retry.result);
             }
           }
         }
@@ -435,8 +675,11 @@ async function main() {
         };
       }
 
-      // Return the result as-is — it's already in MCP content format
-      return resp.result as { content: Array<{ type: string; text: string }> };
+      // Deep unwrap + re-wrap for clean responses
+      if (name === "retrieve_tools") {
+        return compactRetrieveTools(deepUnwrapResult(resp.result), args || {});
+      }
+      return unwrapAndRewrap(resp.result);
     } catch (err) {
       const msg = (err as Error).message;
       log("Tool call error:", name, msg);
