@@ -19,29 +19,15 @@
     "dev:http": "npx tsx src/index.ts serve",
     "prepublishOnly": "npm run build"
   },
-  "keywords": [
-    "mcp",
-    "mcpproxy-go",
-    "proxy",
-    "shim",
-    "stdio",
-    "http",
-    "streamable-http",
-    "model-context-protocol",
-    "args-json",
-    "schema-transform",
-    "claude",
-    "llm"
-  ],
+  "keywords": ["mcp", "mcpproxy-go", "proxy", "shim", "stdio", "http"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/luutuankiet/sandbox-cc",
-    "directory": "plugins/mcp-shim"
+    "url": "https://github.com/luutuankiet/mcp-proxy-shim"
   },
-  "homepage": "https://github.com/luutuankiet/sandbox-cc/tree/main/plugins/mcp-shim#readme",
+  "homepage": "https://github.com/luutuankiet/mcp-proxy-shim#readme",
   "bugs": {
-    "url": "https://github.com/luutuankiet/sandbox-cc/issues"
+    "url": "https://github.com/luutuankiet/mcp-proxy-shim/issues"
   },
   "publishConfig": {
     "access": "public"
