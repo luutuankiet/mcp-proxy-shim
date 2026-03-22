@@ -5,8 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "mcp-proxy-shim": "dist/index.js",
-    "mcp-proxy-shim-http": "dist/http-server.js"
+    "mcp-proxy-shim": "dist/index.js"
   },
   "files": [
     "dist",
@@ -15,9 +14,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "start:http": "node dist/http-server.js",
+    "start:http": "node dist/index.js serve",
     "dev": "npx tsx src/index.ts",
-    "dev:http": "npx tsx src/http-server.ts",
+    "dev:http": "npx tsx src/index.ts serve",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
