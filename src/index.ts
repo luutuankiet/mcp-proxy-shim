@@ -544,7 +544,10 @@ async function main() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    // --- Shim-local: describe_tools (no upstream call) ---
+    // --- Shim-local: describe_tools ---
+    // Hydrates compact retrieve_tools results with full schemas.
+    // Must query upstream retrieve_tools (not tools/list) because remote tools
+    // like "github__create_or_update_file" are only in the upstream search index.
     if (name === "describe_tools") {
       const names = (args?.names ?? []) as string[];
       if (!Array.isArray(names) || names.length === 0) {
@@ -554,18 +557,42 @@ async function main() {
         };
       }
 
-      // Refresh cache to reflect current upstream state
-      try {
-        cachedTools = await fetchUpstreamTools();
-      } catch (err) {
-        log("Tool refresh failed for describe_tools, using cached:", (err as Error).message);
-        if (!cachedTools) throw err;
+      await ensureSession();
+
+      // Derive BM25 search queries from tool names.
+      // e.g. "github__create_or_update_file" → "create or update file"
+      const nameSet = new Set(names);
+      const queries = new Set<string>();
+      for (const n of nameSet) {
+        const parts = n.split("__");
+        const toolPart = parts[parts.length - 1] || n;
+        queries.add(toolPart.replace(/_/g, " "));
       }
 
-      // Build name→tool index for O(1) lookup
+      // Fetch full tool entries from upstream (no compaction applied)
       const index = new Map<string, ToolSchema>();
-      for (const tool of cachedTools) {
-        index.set(tool.name, tool);
+      for (const query of queries) {
+        try {
+          const resp = await mcpRequest("tools/call", {
+            name: "retrieve_tools",
+            arguments: { query },
+          });
+          if (resp?.result) {
+            const unwrapped = deepUnwrapResult(resp.result);
+            const result = unwrapped as Record<string, unknown>;
+            const tools: unknown[] = Array.isArray(result)
+              ? result
+              : (result && Array.isArray(result.tools) ? result.tools as unknown[] : []);
+            for (const t of tools) {
+              const tool = t as ToolSchema;
+              if (tool.name && !index.has(tool.name)) {
+                index.set(tool.name, tool);
+              }
+            }
+          }
+        } catch (err) {
+          log("describe_tools query failed:", query, (err as Error).message);
+        }
       }
 
       // Look up each requested tool — return full schema (with transform applied)
