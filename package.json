@@ -1,6 +1,6 @@
 {
   "name": "@luutuankiet/mcp-proxy-shim",
-  "version": "1.0.0",
+  "version": "1.0.6",
   "description": "Stdio MCP shim for mcpproxy-go — transforms call_tool_* args_json:string to native args:object, eliminating ~400 tokens of JSON escaping overhead per LLM tool call",
   "type": "module",
   "main": "dist/index.js",
