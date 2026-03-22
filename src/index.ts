@@ -573,16 +573,23 @@ async function main() {
       const index = new Map<string, ToolSchema>();
       for (const query of queries) {
         try {
+          log("describe_tools: querying upstream retrieve_tools with:", query);
           const resp = await mcpRequest("tools/call", {
             name: "retrieve_tools",
             arguments: { query },
           });
+          log("describe_tools: resp exists:", !!resp, "resp.result exists:", !!resp?.result);
           if (resp?.result) {
             const unwrapped = deepUnwrapResult(resp.result);
+            log("describe_tools: unwrapped type:", typeof unwrapped, "isArray:", Array.isArray(unwrapped));
+            if (unwrapped && typeof unwrapped === "object" && !Array.isArray(unwrapped)) {
+              log("describe_tools: unwrapped keys:", Object.keys(unwrapped as Record<string, unknown>).join(", "));
+            }
             const result = unwrapped as Record<string, unknown>;
             const tools: unknown[] = Array.isArray(result)
               ? result
               : (result && Array.isArray(result.tools) ? result.tools as unknown[] : []);
+            log("describe_tools: found", tools.length, "tools from query");
             for (const t of tools) {
               const tool = t as ToolSchema;
               if (tool.name && !index.has(tool.name)) {
@@ -594,6 +601,7 @@ async function main() {
           log("describe_tools query failed:", query, (err as Error).message);
         }
       }
+      log("describe_tools: index has", index.size, "tools, looking up:", names.join(", "));
 
       // Look up each requested tool — return full schema (with transform applied)
       const results = names.map((n) => {
