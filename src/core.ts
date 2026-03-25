@@ -284,13 +284,37 @@ function transformToolCallArgs(
 ): Record<string, unknown> {
   if (!CALL_TOOL_NAMES.has(toolName)) return args;
 
-  if ("args_json" in args) return args;
+  if ("args_json" in args) {
+    // Backward compat: if args_json is already present, ensure it's a string.
+    // If it's an object (shouldn't happen but defensive), stringify it.
+    const existing = args.args_json;
+    if (typeof existing !== "string") {
+      return { ...args, args_json: JSON.stringify(existing) };
+    }
+    return args;
+  }
 
   if ("args" in args) {
     const { args: argsObj, ...rest } = args;
+    let argsJson: string;
+
+    if (typeof argsObj === "string") {
+      // args is already a pre-serialized JSON string — validate and use directly
+      // to avoid double-serialization (wrapping in extra quotes).
+      try {
+        JSON.parse(argsObj); // validate it's valid JSON
+        argsJson = argsObj;
+      } catch {
+        // Not valid JSON string — wrap it as a JSON string value
+        argsJson = JSON.stringify(argsObj);
+      }
+    } else {
+      argsJson = JSON.stringify(argsObj);
+    }
+
     return {
       ...rest,
-      args_json: JSON.stringify(argsObj),
+      args_json: argsJson,
     };
   }
 
@@ -507,11 +531,22 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       await ensureSession();
 
       const nameSet = new Set(names);
+      // Generate multiple search queries per tool name for broader coverage:
+      // 1. Full name with separators → spaces (e.g., "bi-platform query")
+      // 2. Last segment only (e.g., "query") as a fallback
+      // 3. Name without server prefix if colon-prefixed (e.g., "bi-platform__query" from "utils:bi-platform__query")
       const queries = new Set<string>();
       for (const n of nameSet) {
-        const parts = n.split("__");
-        const toolPart = parts[parts.length - 1] || n;
-        queries.add(toolPart.replace(/_/g, " "));
+        // Strip optional "server:" prefix for searching
+        const withoutServer = n.includes(":") ? n.split(":").slice(1).join(":") : n;
+        // Full name → spaces (primary query, most specific)
+        queries.add(withoutServer.replace(/__/g, " ").replace(/[-_]/g, " "));
+        // Last __ segment (fallback, broader)
+        const parts = withoutServer.split("__");
+        if (parts.length > 1) {
+          const toolPart = parts[parts.length - 1] || withoutServer;
+          queries.add(toolPart.replace(/[-_]/g, " "));
+        }
       }
 
       const index = new Map<string, ToolSchema>();
@@ -522,18 +557,13 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
             name: "retrieve_tools",
             arguments: { query },
           });
-          log("describe_tools: resp exists:", !!resp, "resp.result exists:", !!resp?.result);
           if (resp?.result) {
             const unwrapped = deepUnwrapResult(resp.result);
-            log("describe_tools: unwrapped type:", typeof unwrapped, "isArray:", Array.isArray(unwrapped));
-            if (unwrapped && typeof unwrapped === "object" && !Array.isArray(unwrapped)) {
-              log("describe_tools: unwrapped keys:", Object.keys(unwrapped as Record<string, unknown>).join(", "));
-            }
             const result = unwrapped as Record<string, unknown>;
             const tools: unknown[] = Array.isArray(result)
               ? result
               : (result && Array.isArray(result.tools) ? result.tools as unknown[] : []);
-            log("describe_tools: found", tools.length, "tools from query");
+            log("describe_tools: found", tools.length, "tools from query:", query);
             for (const t of tools) {
               const tool = t as ToolSchema;
               if (tool.name && !index.has(tool.name)) {
@@ -548,9 +578,40 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       log("describe_tools: index has", index.size, "tools, looking up:", names.join(", "));
 
       const results = names.map((n) => {
-        const tool = index.get(n);
-        if (!tool) return { name: n, error: "not found" };
-        return transformToolSchema(tool);
+        // 1. Exact match
+        let tool = index.get(n);
+        if (tool) return transformToolSchema(tool);
+
+        // 2. Try without server prefix (e.g., "utils:bi-platform__query" → "bi-platform__query")
+        if (n.includes(":")) {
+          const withoutPrefix = n.split(":").slice(1).join(":");
+          tool = index.get(withoutPrefix);
+          if (tool) return transformToolSchema(tool);
+        }
+
+        // 3. Try adding server prefix — check all indexed tools for suffix match
+        for (const [key, candidate] of index) {
+          // key might be "bi-platform__query" and n might be "utils:bi-platform__query"
+          if (key.endsWith(n) || n.endsWith(key)) {
+            return transformToolSchema(candidate);
+          }
+        }
+
+        // 4. Fuzzy suffix match — handle mount-path variations
+        // e.g., n = "workspace__edit_files" should match index key "workspace-mount__edit_files"
+        const nParts = n.includes(":") ? n.split(":").slice(1).join(":").split("__") : n.split("__");
+        const nSuffix = nParts[nParts.length - 1];
+        if (nSuffix) {
+          for (const [, candidate] of index) {
+            const cParts = candidate.name.split("__");
+            const cSuffix = cParts[cParts.length - 1];
+            if (cSuffix === nSuffix && candidate.name.includes(nParts[0])) {
+              return transformToolSchema(candidate);
+            }
+          }
+        }
+
+        return { name: n, error: "not found" };
       });
 
       return {
