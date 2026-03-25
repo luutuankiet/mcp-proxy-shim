@@ -15,8 +15,12 @@ import { dirname, join } from "path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SHIM_PATH = join(__dirname, "..", "dist", "index.js");
 
-const MCP_URL =
-  process.env.MCP_URL || "https://mcpproxy.kenluu.org/mcp/?apikey=admin";
+const MCP_URL = process.env.MCP_URL;
+if (!MCP_URL) {
+  console.error("Fatal: MCP_URL environment variable is required.");
+  console.error("Example: MCP_URL='https://your-proxy/mcp/?apikey=KEY' node test/repro-issues.mjs");
+  process.exit(1);
+}
 
 let reqId = 0;
 
@@ -93,7 +97,7 @@ function parseContent(result) {
 
 async function main() {
   console.log("=== Issue #1 & #2 Reproduction Script ===\n");
-  console.log(`MCP_URL: ${MCP_URL.replace(/apikey=[^&]+/, "apikey=***")}\n`);
+  console.log(`MCP_URL: ${MCP_URL.replace(/apikey=[^&\s]+/gi, "apikey=***")}\n`);
 
   const shim = createShimProcess();
 
