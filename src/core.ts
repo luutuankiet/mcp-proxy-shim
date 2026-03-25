@@ -278,6 +278,30 @@ function transformToolSchema(tool: ToolSchema): ToolSchema {
   };
 }
 
+/**
+ * Ensure a value is a JSON string representing an object (not a primitive).
+ * The upstream Go server expects args_json to unmarshal into map[string]interface{}.
+ * If the value is a primitive JSON string (e.g., "true", "42", '"hello"'),
+ * wrap it in an object to prevent Go unmarshal errors.
+ */
+function ensureJsonObjectString(jsonStr: string): string {
+  try {
+    const parsed = JSON.parse(jsonStr);
+    // Must be a non-null object (not array, not primitive)
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return jsonStr;
+    }
+    // It's valid JSON but not an object — this would cause
+    // "cannot unmarshal X into Go value of type map[string]interface{}"
+    // Fall through to return empty object as safe default
+    log("args_json is valid JSON but not an object, wrapping:", jsonStr.slice(0, 100));
+  } catch {
+    // Not valid JSON at all — log and use empty object
+    log("args_json is not valid JSON, using empty object. Input:", jsonStr.slice(0, 100));
+  }
+  return "{}";
+}
+
 function transformToolCallArgs(
   toolName: string,
   args: Record<string, unknown>,
@@ -286,30 +310,35 @@ function transformToolCallArgs(
 
   if ("args_json" in args) {
     // Backward compat: if args_json is already present, ensure it's a string.
-    // If it's an object (shouldn't happen but defensive), stringify it.
     const existing = args.args_json;
-    if (typeof existing !== "string") {
+    if (typeof existing === "string") {
+      return { ...args, args_json: ensureJsonObjectString(existing) };
+    }
+    // If it's an object (shouldn't happen but defensive), stringify it.
+    if (existing !== null && existing !== undefined && typeof existing === "object") {
       return { ...args, args_json: JSON.stringify(existing) };
     }
-    return args;
+    // Primitive or nullish — use empty object
+    return { ...args, args_json: "{}" };
   }
 
   if ("args" in args) {
     const { args: argsObj, ...rest } = args;
     let argsJson: string;
 
-    if (typeof argsObj === "string") {
-      // args is already a pre-serialized JSON string — validate and use directly
-      // to avoid double-serialization (wrapping in extra quotes).
-      try {
-        JSON.parse(argsObj); // validate it's valid JSON
-        argsJson = argsObj;
-      } catch {
-        // Not valid JSON string — wrap it as a JSON string value
-        argsJson = JSON.stringify(argsObj);
-      }
-    } else {
+    if (argsObj === null || argsObj === undefined) {
+      // Nullish args — safe default to empty object
+      argsJson = "{}";
+    } else if (typeof argsObj === "string") {
+      // args is already a pre-serialized JSON string — validate it's an object
+      // to avoid double-serialization AND ensure upstream Go can unmarshal it.
+      argsJson = ensureJsonObjectString(argsObj);
+    } else if (typeof argsObj === "object") {
       argsJson = JSON.stringify(argsObj);
+    } else {
+      // Primitive (boolean, number) — not a valid args object
+      log("args is a primitive, using empty object. Type:", typeof argsObj);
+      argsJson = "{}";
     }
 
     return {
@@ -388,6 +417,11 @@ function compactRetrieveTools(
     ? result
     : (result && Array.isArray(result.tools) ? result.tools as unknown[] : undefined);
 
+  // Populate persistent schema cache with full tool data before compacting
+  if (tools) {
+    cacheToolSchemas(tools);
+  }
+
   let wasCompacted = false;
   if (compact && tools) {
     const fullJson = JSON.stringify(tools);
@@ -433,6 +467,25 @@ function compactRetrieveTools(
 
 let cachedTools: ToolSchema[] | null = null;
 
+// ---------------------------------------------------------------------------
+// Persistent tool schema cache for describe_tools
+// ---------------------------------------------------------------------------
+// Accumulates full schemas from every retrieve_tools response so that
+// describe_tools can resolve tools by exact name without relying solely
+// on BM25 search queries (which may not return all tools).
+
+const toolSchemaCache = new Map<string, ToolSchema>();
+
+/** Index tools into the persistent schema cache. */
+function cacheToolSchemas(tools: unknown[]): void {
+  for (const t of tools) {
+    const tool = t as ToolSchema;
+    if (tool.name) {
+      toolSchemaCache.set(tool.name, tool);
+    }
+  }
+}
+
 async function fetchUpstreamTools(): Promise<ToolSchema[]> {
   await ensureSession();
 
@@ -448,6 +501,57 @@ async function fetchUpstreamTools(): Promise<ToolSchema[]> {
   log(`Fetched ${tools.length} upstream tools`);
 
   return tools;
+}
+
+// ---------------------------------------------------------------------------
+// Tool name resolution helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a tool name against an index map, handling server prefixes and
+ * suffix matching for mount-path variations.
+ */
+function resolveToolFromIndex(name: string, index: Map<string, ToolSchema>): ToolSchema | undefined {
+  // 1. Exact match
+  let tool = index.get(name);
+  if (tool) return tool;
+
+  // 2. Try without server prefix (e.g., "utils:bi-platform__query" → "bi-platform__query")
+  if (name.includes(":")) {
+    const withoutPrefix = name.split(":").slice(1).join(":");
+    tool = index.get(withoutPrefix);
+    if (tool) return tool;
+  }
+
+  // 3. Try suffix/prefix matching — check all indexed tools
+  for (const [key, candidate] of index) {
+    if (key.endsWith(name) || name.endsWith(key)) {
+      return candidate;
+    }
+  }
+
+  // 4. Fuzzy suffix match — handle mount-path variations
+  const nParts = name.includes(":") ? name.split(":").slice(1).join(":").split("__") : name.split("__");
+  const nSuffix = nParts[nParts.length - 1];
+  if (nSuffix) {
+    for (const [, candidate] of index) {
+      const cParts = candidate.name.split("__");
+      const cSuffix = cParts[cParts.length - 1];
+      if (cSuffix === nSuffix && candidate.name.includes(nParts[0])) {
+        return candidate;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Resolve a tool name against the persistent schema cache.
+ * Uses the same resolution strategy as resolveToolFromIndex.
+ */
+function resolveToolFromCache(name: string): ToolSchema | undefined {
+  return resolveToolFromIndex(name, toolSchemaCache);
 }
 
 // ---------------------------------------------------------------------------
@@ -531,86 +635,88 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       await ensureSession();
 
       const nameSet = new Set(names);
-      // Generate multiple search queries per tool name for broader coverage:
-      // 1. Full name with separators → spaces (e.g., "bi-platform query")
-      // 2. Last segment only (e.g., "query") as a fallback
-      // 3. Name without server prefix if colon-prefixed (e.g., "bi-platform__query" from "utils:bi-platform__query")
-      const queries = new Set<string>();
+
+      // --- Phase 1: Resolve from persistent cache (instant, no upstream calls) ---
+      const resolved = new Map<string, ToolSchema>();
+      const unresolved = new Set<string>();
+
       for (const n of nameSet) {
-        // Strip optional "server:" prefix for searching
-        const withoutServer = n.includes(":") ? n.split(":").slice(1).join(":") : n;
-        // Full name → spaces (primary query, most specific)
-        queries.add(withoutServer.replace(/__/g, " ").replace(/[-_]/g, " "));
-        // Last __ segment (fallback, broader)
-        const parts = withoutServer.split("__");
-        if (parts.length > 1) {
-          const toolPart = parts[parts.length - 1] || withoutServer;
-          queries.add(toolPart.replace(/[-_]/g, " "));
+        const tool = resolveToolFromCache(n);
+        if (tool) {
+          resolved.set(n, tool);
+        } else {
+          unresolved.add(n);
         }
       }
 
-      const index = new Map<string, ToolSchema>();
-      for (const query of queries) {
-        try {
-          log("describe_tools: querying upstream retrieve_tools with:", query);
-          const resp = await mcpRequest("tools/call", {
-            name: "retrieve_tools",
-            arguments: { query },
-          });
-          if (resp?.result) {
-            const unwrapped = deepUnwrapResult(resp.result);
-            const result = unwrapped as Record<string, unknown>;
-            const tools: unknown[] = Array.isArray(result)
-              ? result
-              : (result && Array.isArray(result.tools) ? result.tools as unknown[] : []);
-            log("describe_tools: found", tools.length, "tools from query:", query);
-            for (const t of tools) {
-              const tool = t as ToolSchema;
-              if (tool.name && !index.has(tool.name)) {
-                index.set(tool.name, tool);
+      if (unresolved.size > 0) {
+        log("describe_tools: cache hit", resolved.size, "/ miss", unresolved.size);
+
+        // --- Phase 2: Query upstream retrieve_tools for unresolved names ---
+        // Generate multiple search queries per tool name for broader coverage:
+        // 1. Raw name as-is (exact match in BM25 — most targeted)
+        // 2. Full name with separators → spaces (e.g., "bi-platform query")
+        // 3. Last segment only (e.g., "query") as a fallback
+        const queries = new Set<string>();
+        for (const n of unresolved) {
+          // Strip optional "server:" prefix for searching
+          const withoutServer = n.includes(":") ? n.split(":").slice(1).join(":") : n;
+          // Raw name as-is — BM25 often matches exact tool names better than transformed queries
+          queries.add(withoutServer);
+          // Full name → spaces (primary query, most specific)
+          queries.add(withoutServer.replace(/__/g, " ").replace(/[-_]/g, " "));
+          // Last __ segment (fallback, broader)
+          const parts = withoutServer.split("__");
+          if (parts.length > 1) {
+            const toolPart = parts[parts.length - 1] || withoutServer;
+            queries.add(toolPart.replace(/[-_]/g, " "));
+          }
+        }
+
+        const index = new Map<string, ToolSchema>();
+        for (const query of queries) {
+          try {
+            log("describe_tools: querying upstream retrieve_tools with:", query);
+            const resp = await mcpRequest("tools/call", {
+              name: "retrieve_tools",
+              arguments: { query },
+            });
+            if (resp?.result) {
+              const unwrapped = deepUnwrapResult(resp.result);
+              const result = unwrapped as Record<string, unknown>;
+              const tools: unknown[] = Array.isArray(result)
+                ? result
+                : (result && Array.isArray(result.tools) ? result.tools as unknown[] : []);
+              log("describe_tools: found", tools.length, "tools from query:", query);
+              // Populate both the local index and persistent cache
+              cacheToolSchemas(tools);
+              for (const t of tools) {
+                const tool = t as ToolSchema;
+                if (tool.name && !index.has(tool.name)) {
+                  index.set(tool.name, tool);
+                }
               }
             }
+          } catch (err) {
+            log("describe_tools query failed:", query, (err as Error).message);
           }
-        } catch (err) {
-          log("describe_tools query failed:", query, (err as Error).message);
         }
+        log("describe_tools: index has", index.size, "tools, looking up unresolved:", [...unresolved].join(", "));
+
+        // Try to resolve remaining names from the fresh index
+        for (const n of unresolved) {
+          const tool = resolveToolFromIndex(n, index) ?? resolveToolFromCache(n);
+          if (tool) {
+            resolved.set(n, tool);
+          }
+        }
+      } else {
+        log("describe_tools: all", resolved.size, "tools resolved from cache");
       }
-      log("describe_tools: index has", index.size, "tools, looking up:", names.join(", "));
 
       const results = names.map((n) => {
-        // 1. Exact match
-        let tool = index.get(n);
+        const tool = resolved.get(n);
         if (tool) return transformToolSchema(tool);
-
-        // 2. Try without server prefix (e.g., "utils:bi-platform__query" → "bi-platform__query")
-        if (n.includes(":")) {
-          const withoutPrefix = n.split(":").slice(1).join(":");
-          tool = index.get(withoutPrefix);
-          if (tool) return transformToolSchema(tool);
-        }
-
-        // 3. Try adding server prefix — check all indexed tools for suffix match
-        for (const [key, candidate] of index) {
-          // key might be "bi-platform__query" and n might be "utils:bi-platform__query"
-          if (key.endsWith(n) || n.endsWith(key)) {
-            return transformToolSchema(candidate);
-          }
-        }
-
-        // 4. Fuzzy suffix match — handle mount-path variations
-        // e.g., n = "workspace__edit_files" should match index key "workspace-mount__edit_files"
-        const nParts = n.includes(":") ? n.split(":").slice(1).join(":").split("__") : n.split("__");
-        const nSuffix = nParts[nParts.length - 1];
-        if (nSuffix) {
-          for (const [, candidate] of index) {
-            const cParts = candidate.name.split("__");
-            const cSuffix = cParts[cParts.length - 1];
-            if (cSuffix === nSuffix && candidate.name.includes(nParts[0])) {
-              return transformToolSchema(candidate);
-            }
-          }
-        }
-
         return { name: n, error: "not found" };
       });
 
@@ -669,6 +775,7 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       }
 
       if (name === "retrieve_tools") {
+        // compactRetrieveTools already populates the persistent cache
         return compactRetrieveTools(deepUnwrapResult(resp.result), args || {});
       }
       return unwrapAndRewrap(resp.result);
