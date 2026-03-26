@@ -189,6 +189,15 @@ async function handleRetrieveTools(
   }
 }
 
+/**
+ * describe_tools — batch-hydrate tool schemas.
+ *
+ * Strategy (mirrors core.ts shim-local describe_tools):
+ * 1. Derive multiple BM25 search queries from each requested name
+ * 2. Query upstream retrieve_tools for each (gets FULL schemas, not compacted)
+ * 3. Build an index keyed by raw name + server:name composite
+ * 4. Resolve each requested name with flexible matching
+ */
 async function handleDescribeTools(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -203,29 +212,89 @@ async function handleDescribeTools(
     await ensureSession();
     callCount++;
 
-    const results: unknown[] = [];
-    for (const name of names) {
-      const resp = await mcpRequest("tools/call", {
-        name: "retrieve_tools",
-        arguments: { query: name },
-      });
-      if (resp?.result) {
-        const unwrapped = deepUnwrapResult(resp.result);
-        const arr = Array.isArray(unwrapped)
-          ? unwrapped
-          : (unwrapped as Record<string, unknown>)?.tools;
-        if (Array.isArray(arr)) {
-          const match = arr.find(
-            (t: Record<string, unknown>) => t.name === name,
-          );
-          results.push(match || { name, error: "not found" });
-        } else {
-          results.push({ name, error: "not found" });
+    // 1. Derive search queries from tool names (same strategy as core.ts)
+    const queries = new Set<string>();
+    for (const n of names) {
+      const raw = n.includes(":") ? n.split(":").slice(1).join(":") : n;
+      // Raw name as-is — BM25 often matches exact tool names well
+      queries.add(raw);
+      // Full name with separators → spaces
+      queries.add(raw.replace(/__/g, " ").replace(/[-_]/g, " "));
+      // Segment-based queries for compound names
+      const parts = raw.split("__");
+      if (parts.length > 1) {
+        const toolPart = parts[parts.length - 1] || raw;
+        queries.add(toolPart.replace(/[-_]/g, " "));
+        const prefixPart = parts[0];
+        if (prefixPart && prefixPart !== toolPart) {
+          queries.add(prefixPart.replace(/[-_]/g, " ") + " " + toolPart.replace(/[-_]/g, " "));
         }
-      } else {
-        results.push({ name, error: "upstream error" });
       }
     }
+
+    // 2. Query upstream retrieve_tools for each (full schemas, no compaction)
+    const index = new Map<string, Record<string, unknown>>();
+    for (const query of queries) {
+      try {
+        const resp = await mcpRequest("tools/call", {
+          name: "retrieve_tools",
+          arguments: { query },
+        });
+        if (resp?.result) {
+          const unwrapped = deepUnwrapResult(resp.result) as Record<string, unknown>;
+          const tools: unknown[] = Array.isArray(unwrapped)
+            ? unwrapped
+            : (Array.isArray(unwrapped?.tools) ? unwrapped.tools as unknown[] : []);
+          for (const t of tools) {
+            const tool = t as Record<string, unknown>;
+            const tName = tool.name as string;
+            if (tName && !index.has(tName)) {
+              index.set(tName, tool);
+            }
+            // Also key by server:name composite for flexible lookup
+            if (tool.server) {
+              const composite = `${tool.server}:${tName}`;
+              if (!index.has(composite)) index.set(composite, tool);
+            }
+          }
+        }
+      } catch (err) {
+        log("describe_tools query failed:", query, (err as Error).message);
+      }
+    }
+
+    // 3. Resolve each requested name with flexible matching
+    const results = names.map((n) => {
+      // Exact match
+      let tool = index.get(n);
+      if (tool) return tool;
+
+      // Without server: prefix (e.g., "utils:read_files" → "read_files")
+      if (n.includes(":")) {
+        const withoutPrefix = n.split(":").slice(1).join(":");
+        tool = index.get(withoutPrefix);
+        if (tool) return tool;
+      }
+
+      // Suffix/prefix match
+      for (const [key, candidate] of index) {
+        if (key.endsWith(n) || n.endsWith(key)) return candidate;
+      }
+
+      // Fuzzy suffix match — handle mount-path variations
+      const nParts = n.includes(":") ? n.split(":").slice(1).join(":").split("__") : n.split("__");
+      const nSuffix = nParts[nParts.length - 1];
+      if (nSuffix) {
+        for (const [, candidate] of index) {
+          const cName = candidate.name as string;
+          const cParts = cName.split("__");
+          const cSuffix = cParts[cParts.length - 1];
+          if (cSuffix === nSuffix && cName.includes(nParts[0])) return candidate;
+        }
+      }
+
+      return { name: n, error: "not found" };
+    });
 
     return jsonResponse(res, 200, results);
   } catch (err) {
