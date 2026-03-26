@@ -259,7 +259,11 @@ function transformToolSchema(tool: ToolSchema): ToolSchema {
   props.args = {
     type: "object",
     description:
-      "Tool arguments as a native JSON object. The shim serializes this to args_json before forwarding upstream.",
+      "The upstream tool's arguments as a native JSON object (not a string). " +
+      "Use describe_tools to get the upstream tool's inputSchema, then pass " +
+      "those fields here directly. Example: if the upstream tool expects " +
+      '{owner: string, repo: string}, pass args: {"owner": "foo", "repo": "bar"}. ' +
+      "Nested strings containing JSON are fine — only the top-level args must be an object.",
     additionalProperties: true,
   };
 
@@ -278,19 +282,105 @@ function transformToolSchema(tool: ToolSchema): ToolSchema {
   };
 }
 
+/**
+ * Validate and re-serialize a JSON string to canonical form.
+ * The upstream Go server expects args_json to unmarshal into map[string]interface{}.
+ *
+ * CRITICAL: Always re-serializes from the parsed object via JSON.stringify()
+ * rather than passing through the raw input string. This prevents failures when
+ * args arrives as a pre-serialized string from the LLM with non-canonical
+ * escaping, encoding quirks, or formatting that Go's json.Unmarshal rejects.
+ * See: https://github.com/luutuankiet/mcp-proxy-shim/issues/1
+ *
+ * Throws ArgsValidationError on invalid input — never silently drops data.
+ */
+class ArgsValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ArgsValidationError";
+  }
+}
+
+function validateAndSerializeArgs(jsonStr: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (err) {
+    throw new ArgsValidationError(
+      `args is a string but not valid JSON. The "args" field must be a native JSON object, ` +
+      `not a pre-serialized string. Pass args as {"key": "value"}, not as '{"key": "value"}'. ` +
+      `Parse error: ${(err as Error).message}. Input (first 200 chars): ${jsonStr.slice(0, 200)}`
+    );
+  }
+
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const actualType = parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed;
+    throw new ArgsValidationError(
+      `args must be a JSON object, got ${actualType}. ` +
+      `Pass args as {"key": "value"}, not as a primitive or array. ` +
+      `Input: ${jsonStr.slice(0, 200)}`
+    );
+  }
+
+  // Re-serialize from parsed object for canonical JSON.
+  // Do NOT return jsonStr directly — the raw string from the LLM may have
+  // non-canonical escaping (e.g., \\/ vs /, unicode escapes, whitespace)
+  // that Go's json.Unmarshal handles differently than Node's JSON.parse.
+  return JSON.stringify(parsed);
+}
+
+/**
+ * Transform call_tool_* arguments: args:object → args_json:string.
+ * Returns the transformed args, or throws ArgsValidationError if
+ * the client sends malformed args.
+ */
 function transformToolCallArgs(
   toolName: string,
   args: Record<string, unknown>,
 ): Record<string, unknown> {
   if (!CALL_TOOL_NAMES.has(toolName)) return args;
 
-  if ("args_json" in args) return args;
+  if ("args_json" in args) {
+    // Backward compat: if args_json is already present, ensure it's a string.
+    const existing = args.args_json;
+    if (typeof existing === "string") {
+      return { ...args, args_json: validateAndSerializeArgs(existing) };
+    }
+    // If it's an object, stringify it.
+    if (existing !== null && existing !== undefined && typeof existing === "object") {
+      return { ...args, args_json: JSON.stringify(existing) };
+    }
+    throw new ArgsValidationError(
+      `args_json must be a JSON string or object, got ${existing === null ? "null" : typeof existing}. ` +
+      `Pass args_json as '{"key": "value"}' (string) or use the "args" field with a native object instead.`
+    );
+  }
 
   if ("args" in args) {
     const { args: argsObj, ...rest } = args;
+    let argsJson: string;
+
+    if (argsObj === null || argsObj === undefined) {
+      // Nullish args — treat as empty object (common for tools with no required params)
+      argsJson = "{}";
+    } else if (typeof argsObj === "string") {
+      // LLM sent args as a pre-serialized string — validate and re-serialize.
+      argsJson = validateAndSerializeArgs(argsObj);
+    } else if (typeof argsObj === "object" && !Array.isArray(argsObj)) {
+      // Happy path: native object → serialize.
+      // Nested strings containing JSON are fine — JSON.stringify handles them correctly.
+      argsJson = JSON.stringify(argsObj);
+    } else {
+      const actualType = Array.isArray(argsObj) ? "array" : typeof argsObj;
+      throw new ArgsValidationError(
+        `args must be a JSON object, got ${actualType}. ` +
+        `Pass args as {"key": "value"}. Use describe_tools to get the upstream tool's inputSchema.`
+      );
+    }
+
     return {
       ...rest,
-      args_json: JSON.stringify(argsObj),
+      args_json: argsJson,
     };
   }
 
@@ -409,6 +499,7 @@ function compactRetrieveTools(
 
 let cachedTools: ToolSchema[] | null = null;
 
+
 async function fetchUpstreamTools(): Promise<ToolSchema[]> {
   await ensureSession();
 
@@ -425,6 +516,50 @@ async function fetchUpstreamTools(): Promise<ToolSchema[]> {
 
   return tools;
 }
+
+// ---------------------------------------------------------------------------
+// Tool name resolution helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a tool name against an index map, handling server prefixes and
+ * suffix matching for mount-path variations.
+ */
+function resolveToolFromIndex(name: string, index: Map<string, ToolSchema>): ToolSchema | undefined {
+  // 1. Exact match
+  let tool = index.get(name);
+  if (tool) return tool;
+
+  // 2. Try without server prefix (e.g., "utils:bi-platform__query" → "bi-platform__query")
+  if (name.includes(":")) {
+    const withoutPrefix = name.split(":").slice(1).join(":");
+    tool = index.get(withoutPrefix);
+    if (tool) return tool;
+  }
+
+  // 3. Try suffix/prefix matching — check all indexed tools
+  for (const [key, candidate] of index) {
+    if (key.endsWith(name) || name.endsWith(key)) {
+      return candidate;
+    }
+  }
+
+  // 4. Fuzzy suffix match — handle mount-path variations
+  const nParts = name.includes(":") ? name.split(":").slice(1).join(":").split("__") : name.split("__");
+  const nSuffix = nParts[nParts.length - 1];
+  if (nSuffix) {
+    for (const [, candidate] of index) {
+      const cParts = candidate.name.split("__");
+      const cSuffix = cParts[cParts.length - 1];
+      if (cSuffix === nSuffix && candidate.name.includes(nParts[0])) {
+        return candidate;
+      }
+    }
+  }
+
+  return undefined;
+}
+
 
 // ---------------------------------------------------------------------------
 // Server factory — creates a wired-up MCP Server (transport-agnostic)
@@ -507,11 +642,33 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       await ensureSession();
 
       const nameSet = new Set(names);
+
+      // Always query live BM25 — no caching. Generate multiple search
+      // queries per tool name for broader coverage:
+      // 1. Raw name as-is (exact match in BM25 — most targeted)
+      // 2. Full name with separators → spaces (e.g., "bi-platform query")
+      // 3. Last __ segment only (e.g., "query") as a broader fallback
+      // 4. First __ segment (e.g., "bi-platform") for server/mount prefix matching
       const queries = new Set<string>();
       for (const n of nameSet) {
-        const parts = n.split("__");
-        const toolPart = parts[parts.length - 1] || n;
-        queries.add(toolPart.replace(/_/g, " "));
+        // Strip optional "server:" prefix for searching
+        const withoutServer = n.includes(":") ? n.split(":").slice(1).join(":") : n;
+        // Raw name as-is — BM25 often matches exact tool names better than transformed queries
+        queries.add(withoutServer);
+        // Full name → spaces (primary query, most specific)
+        queries.add(withoutServer.replace(/__/g, " ").replace(/[-_]/g, " "));
+        // Segment-based queries for compound names
+        const parts = withoutServer.split("__");
+        if (parts.length > 1) {
+          // Last segment: tool action (e.g., "query", "edit_files")
+          const toolPart = parts[parts.length - 1] || withoutServer;
+          queries.add(toolPart.replace(/[-_]/g, " "));
+          // First segment: server/mount prefix (e.g., "looker-da", "hetzner_at_slash")
+          const prefixPart = parts[0];
+          if (prefixPart && prefixPart !== toolPart) {
+            queries.add(prefixPart.replace(/[-_]/g, " ") + " " + toolPart.replace(/[-_]/g, " "));
+          }
+        }
       }
 
       const index = new Map<string, ToolSchema>();
@@ -522,18 +679,13 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
             name: "retrieve_tools",
             arguments: { query },
           });
-          log("describe_tools: resp exists:", !!resp, "resp.result exists:", !!resp?.result);
           if (resp?.result) {
             const unwrapped = deepUnwrapResult(resp.result);
-            log("describe_tools: unwrapped type:", typeof unwrapped, "isArray:", Array.isArray(unwrapped));
-            if (unwrapped && typeof unwrapped === "object" && !Array.isArray(unwrapped)) {
-              log("describe_tools: unwrapped keys:", Object.keys(unwrapped as Record<string, unknown>).join(", "));
-            }
             const result = unwrapped as Record<string, unknown>;
             const tools: unknown[] = Array.isArray(result)
               ? result
               : (result && Array.isArray(result.tools) ? result.tools as unknown[] : []);
-            log("describe_tools: found", tools.length, "tools from query");
+            log("describe_tools: found", tools.length, "tools from query:", query);
             for (const t of tools) {
               const tool = t as ToolSchema;
               if (tool.name && !index.has(tool.name)) {
@@ -548,9 +700,9 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       log("describe_tools: index has", index.size, "tools, looking up:", names.join(", "));
 
       const results = names.map((n) => {
-        const tool = index.get(n);
-        if (!tool) return { name: n, error: "not found" };
-        return transformToolSchema(tool);
+        const tool = resolveToolFromIndex(n, index);
+        if (tool) return transformToolSchema(tool);
+        return { name: n, error: "not found" };
       });
 
       return {
@@ -558,7 +710,19 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       };
     }
 
-    const forwardArgs = transformToolCallArgs(name, args || {});
+    let forwardArgs: Record<string, unknown>;
+    try {
+      forwardArgs = transformToolCallArgs(name, args || {});
+    } catch (err) {
+      if (err instanceof ArgsValidationError) {
+        log("Args validation rejected:", err.message);
+        return {
+          content: [{ type: "text" as const, text: err.message }],
+          isError: true,
+        };
+      }
+      throw err;
+    }
 
     try {
       await ensureSession();
