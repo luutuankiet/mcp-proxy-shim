@@ -259,7 +259,11 @@ function transformToolSchema(tool: ToolSchema): ToolSchema {
   props.args = {
     type: "object",
     description:
-      "Tool arguments as a native JSON object. The shim serializes this to args_json before forwarding upstream.",
+      "The upstream tool's arguments as a native JSON object (not a string). " +
+      "Use describe_tools to get the upstream tool's inputSchema, then pass " +
+      "those fields here directly. Example: if the upstream tool expects " +
+      '{owner: string, repo: string}, pass args: {"owner": "foo", "repo": "bar"}. ' +
+      "Nested strings containing JSON are fine — only the top-level args must be an object.",
     additionalProperties: true,
   };
 
@@ -279,7 +283,7 @@ function transformToolSchema(tool: ToolSchema): ToolSchema {
 }
 
 /**
- * Ensure a value is a JSON string representing an object (not a primitive).
+ * Validate and re-serialize a JSON string to canonical form.
  * The upstream Go server expects args_json to unmarshal into map[string]interface{}.
  *
  * CRITICAL: Always re-serializes from the parsed object via JSON.stringify()
@@ -287,29 +291,49 @@ function transformToolSchema(tool: ToolSchema): ToolSchema {
  * args arrives as a pre-serialized string from the LLM with non-canonical
  * escaping, encoding quirks, or formatting that Go's json.Unmarshal rejects.
  * See: https://github.com/luutuankiet/mcp-proxy-shim/issues/1
+ *
+ * Throws ArgsValidationError on invalid input — never silently drops data.
  */
-function ensureJsonObjectString(jsonStr: string): string {
-  try {
-    const parsed = JSON.parse(jsonStr);
-    // Must be a non-null object (not array, not primitive)
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      // Re-serialize from parsed object for canonical JSON.
-      // Do NOT return jsonStr directly — the raw string from the LLM may have
-      // non-canonical escaping (e.g., \\/ vs /, unicode escapes, whitespace)
-      // that Go's json.Unmarshal handles differently than Node's JSON.parse.
-      return JSON.stringify(parsed);
-    }
-    // It's valid JSON but not an object — this would cause
-    // "cannot unmarshal X into Go value of type map[string]interface{}"
-    // Fall through to return empty object as safe default
-    log("args_json is valid JSON but not an object, wrapping:", jsonStr.slice(0, 100));
-  } catch {
-    // Not valid JSON at all — log and use empty object
-    log("args_json is not valid JSON, using empty object. Input:", jsonStr.slice(0, 100));
+class ArgsValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ArgsValidationError";
   }
-  return "{}";
 }
 
+function validateAndSerializeArgs(jsonStr: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (err) {
+    throw new ArgsValidationError(
+      `args is a string but not valid JSON. The "args" field must be a native JSON object, ` +
+      `not a pre-serialized string. Pass args as {"key": "value"}, not as '{"key": "value"}'. ` +
+      `Parse error: ${(err as Error).message}. Input (first 200 chars): ${jsonStr.slice(0, 200)}`
+    );
+  }
+
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const actualType = parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed;
+    throw new ArgsValidationError(
+      `args must be a JSON object, got ${actualType}. ` +
+      `Pass args as {"key": "value"}, not as a primitive or array. ` +
+      `Input: ${jsonStr.slice(0, 200)}`
+    );
+  }
+
+  // Re-serialize from parsed object for canonical JSON.
+  // Do NOT return jsonStr directly — the raw string from the LLM may have
+  // non-canonical escaping (e.g., \\/ vs /, unicode escapes, whitespace)
+  // that Go's json.Unmarshal handles differently than Node's JSON.parse.
+  return JSON.stringify(parsed);
+}
+
+/**
+ * Transform call_tool_* arguments: args:object → args_json:string.
+ * Returns the transformed args, or throws ArgsValidationError if
+ * the client sends malformed args.
+ */
 function transformToolCallArgs(
   toolName: string,
   args: Record<string, unknown>,
@@ -320,14 +344,16 @@ function transformToolCallArgs(
     // Backward compat: if args_json is already present, ensure it's a string.
     const existing = args.args_json;
     if (typeof existing === "string") {
-      return { ...args, args_json: ensureJsonObjectString(existing) };
+      return { ...args, args_json: validateAndSerializeArgs(existing) };
     }
-    // If it's an object (shouldn't happen but defensive), stringify it.
+    // If it's an object, stringify it.
     if (existing !== null && existing !== undefined && typeof existing === "object") {
       return { ...args, args_json: JSON.stringify(existing) };
     }
-    // Primitive or nullish — use empty object
-    return { ...args, args_json: "{}" };
+    throw new ArgsValidationError(
+      `args_json must be a JSON string or object, got ${existing === null ? "null" : typeof existing}. ` +
+      `Pass args_json as '{"key": "value"}' (string) or use the "args" field with a native object instead.`
+    );
   }
 
   if ("args" in args) {
@@ -335,18 +361,21 @@ function transformToolCallArgs(
     let argsJson: string;
 
     if (argsObj === null || argsObj === undefined) {
-      // Nullish args — safe default to empty object
+      // Nullish args — treat as empty object (common for tools with no required params)
       argsJson = "{}";
     } else if (typeof argsObj === "string") {
-      // args is already a pre-serialized JSON string — validate it's an object
-      // to avoid double-serialization AND ensure upstream Go can unmarshal it.
-      argsJson = ensureJsonObjectString(argsObj);
-    } else if (typeof argsObj === "object") {
+      // LLM sent args as a pre-serialized string — validate and re-serialize.
+      argsJson = validateAndSerializeArgs(argsObj);
+    } else if (typeof argsObj === "object" && !Array.isArray(argsObj)) {
+      // Happy path: native object → serialize.
+      // Nested strings containing JSON are fine — JSON.stringify handles them correctly.
       argsJson = JSON.stringify(argsObj);
     } else {
-      // Primitive (boolean, number) — not a valid args object
-      log("args is a primitive, using empty object. Type:", typeof argsObj);
-      argsJson = "{}";
+      const actualType = Array.isArray(argsObj) ? "array" : typeof argsObj;
+      throw new ArgsValidationError(
+        `args must be a JSON object, got ${actualType}. ` +
+        `Pass args as {"key": "value"}. Use describe_tools to get the upstream tool's inputSchema.`
+      );
     }
 
     return {
@@ -681,7 +710,19 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       };
     }
 
-    const forwardArgs = transformToolCallArgs(name, args || {});
+    let forwardArgs: Record<string, unknown>;
+    try {
+      forwardArgs = transformToolCallArgs(name, args || {});
+    } catch (err) {
+      if (err instanceof ArgsValidationError) {
+        log("Args validation rejected:", err.message);
+        return {
+          content: [{ type: "text" as const, text: err.message }],
+          isError: true,
+        };
+      }
+      throw err;
+    }
 
     try {
       await ensureSession();
