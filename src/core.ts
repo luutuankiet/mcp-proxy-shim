@@ -70,6 +70,16 @@ const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
 // ---------------------------------------------------------------------------
 
 let sessionId: string | null = null;
+
+/** Expose session ID for daemon health endpoint */
+export function getSessionId(): string | null {
+  return sessionId;
+}
+
+/** Force-reset session (for daemon /reinit endpoint) */
+export function resetSessionId(): void {
+  sessionId = null;
+}
 let reqId = 0;
 
 export function log(...args: unknown[]) {
@@ -93,7 +103,7 @@ interface JsonRpcResponse {
  * Send a JSON-RPC request/notification to upstream mcpproxy-go.
  * Handles session header, timeouts, and basic retry on transient failures.
  */
-async function mcpRequest(
+export async function mcpRequest(
   method: string,
   params: Record<string, unknown>,
   isNotification = false,
@@ -219,7 +229,7 @@ export async function ensureSession(): Promise<void> {
   }
 }
 
-async function reinitOnExpiry(): Promise<boolean> {
+export async function reinitOnExpiry(): Promise<boolean> {
   log("Session may have expired — re-initializing...");
   sessionId = null;
   try {
@@ -334,7 +344,7 @@ function validateAndSerializeArgs(jsonStr: string): string {
  * Returns the transformed args, or throws ArgsValidationError if
  * the client sends malformed args.
  */
-function transformToolCallArgs(
+export function transformToolCallArgs(
   toolName: string,
   args: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -423,7 +433,7 @@ function deepParseText(text: string, maxDepth = 5): unknown {
   return value;
 }
 
-function deepUnwrapResult(result: unknown): unknown {
+export function deepUnwrapResult(result: unknown): unknown {
   if (!isMcpContentWrapper(result)) return result;
   if (result.content.length === 1) {
     return deepParseText(result.content[0].text);
@@ -442,7 +452,7 @@ function unwrapAndRewrap(result: unknown): { content: Array<{ type: "text"; text
   return { content: [{ type: "text", text }] };
 }
 
-function compactRetrieveTools(
+export function compactRetrieveTools(
   unwrapped: unknown,
   args: Record<string, unknown>,
 ): { content: Array<{ type: "text"; text: string }> } {

@@ -17,6 +17,7 @@
     "start:http": "node dist/index.js serve",
     "dev": "npx tsx src/index.ts",
     "dev:http": "npx tsx src/index.ts serve",
+    "test:daemon": "node test/daemon-e2e.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
