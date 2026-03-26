@@ -197,6 +197,138 @@ Each downstream client gets its own MCP session, but all sessions **share a sing
 | `/mcp` | DELETE | `?apikey=` | Session termination |
 | `/health` | GET | None | Health check (session count, uptime) |
 
+### Option C: Daemon Mode (multi-server MCP gateway)
+
+Run a standalone gateway that connects to **multiple** MCP servers (stdio or HTTP) and exposes all their tools through a single HTTP endpoint. Pure passthrough — no schema transformation.
+
+**Use case:** Cloud agents (claude.ai/code, Codespaces, etc.) that can't spawn MCP servers on the fly.
+
+```
+Cloud Agent ──HTTP──▶ daemon (:3456) ──┬── stdio ──▶ github MCP
+                                       ├── stdio ──▶ filesystem MCP
+                                       └── HTTP  ──▶ remote API (with auth headers)
+```
+
+#### Inline config
+
+```bash
+MCP_SERVERS='{
+  "github": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env": { "GITHUB_TOKEN": "ghp_..." }
+  },
+  "my-api": {
+    "type": "streamableHttp",
+    "url": "https://api.example.com/mcp",
+    "headers": { "Authorization": "Bearer xxx", "X-Org-Id": "org_123" }
+  }
+}' npx @luutuankiet/mcp-proxy-shim daemon
+```
+
+#### Config file
+
+```bash
+MCP_CONFIG=./mcp-servers.json npx @luutuankiet/mcp-proxy-shim daemon
+```
+
+The config file supports three formats:
+- Flat: `{ "server-name": { "type": "stdio", ... } }`
+- Wrapped: `{ "servers": { "server-name": { ... } } }`
+- `.mcp.json` format: `{ "mcpServers": { "server-name": { ... } } }`
+
+#### How clients use it
+
+All upstream tools are **namespaced** with the server name as prefix:
+
+```
+github__get_file_contents    ← from the "github" server
+my-api__query                ← from the "my-api" server
+```
+
+A built-in `daemon_help` tool provides a full usage guide:
+
+```json
+{ "name": "daemon_help", "arguments": {} }
+```
+
+Returns connected servers, all tools with namespaced names, and calling examples. You can also filter to a specific server for full schemas:
+
+```json
+{ "name": "daemon_help", "arguments": { "server": "github" } }
+```
+
+The daemon also returns `instructions` in the MCP `initialize` response, so MCP clients that support server instructions will automatically know how to use it.
+
+#### Server config reference
+
+**Stdio servers** (spawn a local process):
+
+```json
+{
+  "type": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-github"],
+  "env": { "GITHUB_TOKEN": "ghp_..." },
+  "cwd": "/optional/working/directory"
+}
+```
+
+**HTTP Streamable servers** (connect to remote MCP):
+
+```json
+{
+  "type": "streamableHttp",
+  "url": "https://api.example.com/mcp",
+  "headers": {
+    "Authorization": "Bearer your-token",
+    "X-Custom-Header": "value"
+  }
+}
+```
+
+The `headers` field supports any custom HTTP headers — useful for authentication, org routing, or API versioning.
+
+#### Daemon environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_SERVERS` | — | JSON string with server configs (inline) |
+| `MCP_CONFIG` | — | Path to JSON config file (alternative to MCP_SERVERS) |
+| `MCP_PORT` | `3456` | Port to listen on |
+| `MCP_HOST` | `0.0.0.0` | Host to bind to |
+| `MCP_APIKEY` | — (open) | Require `?apikey=KEY` on `/mcp` requests |
+| `https_proxy` | — | HTTPS proxy for HTTP upstream connections |
+
+#### Daemon endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/mcp` | POST | MCP JSON-RPC (initialize, tools/list, tools/call) |
+| `/mcp` | GET | SSE stream reconnection |
+| `/mcp` | DELETE | Session termination |
+| `/health` | GET | Per-server status, tool counts, uptime |
+
+#### Production deployment
+
+```yaml
+# docker-compose.yml
+services:
+  mcp-daemon:
+    image: node:22-slim
+    command: npx -y @luutuankiet/mcp-proxy-shim daemon
+    environment:
+      - MCP_CONFIG=/config/servers.json
+      - MCP_APIKEY=your-secret
+    ports:
+      - "3456:3456"
+    volumes:
+      - ./mcp-servers.json:/config/servers.json:ro
+```
+
+---
+
 ## Why Not `/mcp/all`?
 
 mcpproxy-go exposes two routing modes:
@@ -253,13 +385,15 @@ We tested this live: added a YNAB financial tool mid-session → 43 new tools ap
 
 ### Transport Modes
 
-| Feature | Stdio | HTTP Streamable (`serve`) |
-|---------|-------|--------------------------|
-| Use case | Local MCP client (Claude Code, Cursor) | Remote agents, cloud sandboxes |
-| Connection | stdin/stdout | HTTP POST/GET/DELETE on `/mcp` |
-| Auth | N/A (local process) | Optional `?apikey=` query param |
-| Multi-client | Single client | Multiple concurrent sessions |
-| Upstream sharing | One-to-one | Many-to-one (shared upstream) |
+| Feature | Stdio | HTTP Streamable (`serve`) | Daemon (`daemon`) |
+|---------|-------|--------------------------|-------------------|
+| Use case | Local MCP client (Claude Code, Cursor) | Remote agents, single upstream | Cloud agents, multi-server gateway |
+| Connection | stdin/stdout | HTTP on `/mcp` | HTTP on `/mcp` |
+| Upstreams | Single (mcpproxy-go) | Single (mcpproxy-go) | Multiple (stdio + HTTP) |
+| Schema transforms | `args_json` → `args` | `args_json` → `args` | None (pure passthrough) |
+| Auth | N/A (local process) | Optional `?apikey=` | Optional `?apikey=` |
+| Multi-client | Single | Multiple sessions | Multiple sessions |
+| Custom headers | N/A | N/A | Per-upstream `headers` config |
 
 ### Session Management
 
@@ -301,8 +435,9 @@ git clone https://github.com/luutuankiet/mcp-proxy-shim
 cd mcp-proxy-shim
 npm install
 npm run build
-npm start         # stdio mode (connects upstream, waits for stdio)
-npm run start:http  # HTTP serve mode
+npm start             # stdio mode (connects upstream, waits for stdio)
+npm run start:http    # HTTP serve mode
+node dist/index.js daemon  # daemon mode (set MCP_SERVERS or MCP_CONFIG)
 ```
 
 ### Testing

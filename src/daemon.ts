@@ -266,11 +266,83 @@ async function refreshTools(server: UpstreamServer): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Aggregated tool list
+// Aggregated tool list + helper tools
 // ---------------------------------------------------------------------------
 
+/** Build a usage guide for the current daemon state */
+function buildUsageGuide(): string {
+  const servers = [...upstreams.values()].filter((s) => s.connected);
+  const lines: string[] = [
+    "# MCP Daemon — Usage Guide",
+    "",
+    "This is an MCP gateway that aggregates tools from multiple upstream servers.",
+    "All tools are namespaced: `<server>__<tool>` (double underscore separator).",
+    "",
+    "## Connected Servers",
+    "",
+  ];
+
+  for (const server of servers) {
+    const type = server.config.type;
+    lines.push(`### \`${server.name}\` (${type})`);
+    lines.push("");
+    lines.push(`Tools (${server.tools.length}):`);
+    for (const tool of server.tools) {
+      const desc = tool.description ? ` — ${tool.description.slice(0, 80)}${tool.description.length > 80 ? "..." : ""}` : "";
+      lines.push(`- \`${namespaceTool(server.name, tool.name)}\`${desc}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("## How to Call Tools");
+  lines.push("");
+  lines.push("1. Find the tool you need from the list above");
+  lines.push("2. Call it using the full namespaced name (e.g., `github__get_file_contents`)");
+  lines.push("3. Pass arguments as a native JSON object — no special serialization needed");
+  lines.push("");
+  lines.push("### Example");
+  lines.push("");
+
+  // Generate a real example from the first server's first tool
+  if (servers.length > 0 && servers[0].tools.length > 0) {
+    const example = servers[0].tools[0];
+    const exampleName = namespaceTool(servers[0].name, example.name);
+    const exampleArgs = example.inputSchema?.properties
+      ? Object.fromEntries(
+          Object.entries(example.inputSchema.properties as Record<string, { type?: string }>)
+            .slice(0, 3)
+            .map(([k, v]) => [k, v.type === "number" ? 1 : v.type === "boolean" ? true : "..."])
+        )
+      : {};
+    lines.push("```json");
+    lines.push(`{ "name": "${exampleName}", "arguments": ${JSON.stringify(exampleArgs)} }`);
+    lines.push("```");
+  }
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+/** Shim-local tool schemas injected into the aggregated tool list */
+const DAEMON_HELP_TOOL: ToolDef = {
+  name: "daemon_help",
+  description:
+    "Get usage guide for this MCP daemon — lists all connected servers, " +
+    "their tools (with namespaced names), and how to call them. " +
+    "Call this FIRST if you're unsure how to use this gateway.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      server: {
+        type: "string",
+        description: "Optional: filter help to a specific server name",
+      },
+    },
+  },
+};
+
 function getAggregatedTools(): ToolDef[] {
-  const allTools: ToolDef[] = [];
+  const allTools: ToolDef[] = [DAEMON_HELP_TOOL];
   for (const [, server] of upstreams) {
     if (!server.connected) continue;
     for (const tool of server.tools) {
@@ -307,10 +379,23 @@ async function createDownstreamSession(): Promise<StreamableHTTPServerTransport>
     }
   };
 
+  // Build server instructions so clients know how to use the daemon
+  const connectedServers = [...upstreams.values()].filter((s) => s.connected);
+  const serverList = connectedServers.map((s) => `${s.name} (${s.tools.length} tools)`).join(", ");
+  const instructions = [
+    "MCP Daemon — Multi-server gateway.",
+    `Connected servers: ${serverList}.`,
+    "All tools are namespaced as <server>__<tool> (double underscore).",
+    "Call daemon_help for a full usage guide with all available tools.",
+  ].join(" ");
+
   // Create MCP server for this session
   const server = new Server(
     { name: "mcp-daemon", version: "1.0.0" },
-    { capabilities: { tools: {} } },
+    {
+      capabilities: { tools: {} },
+      instructions,
+    },
   );
 
   // Handle tools/list — aggregate from all upstreams
@@ -329,10 +414,48 @@ async function createDownstreamSession(): Promise<StreamableHTTPServerTransport>
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
+    // --- Shim-local: daemon_help ---
+    if (name === "daemon_help") {
+      const filterServer = (args?.server as string) || "";
+      if (filterServer) {
+        const upstream = upstreams.get(filterServer);
+        if (!upstream || !upstream.connected) {
+          return {
+            content: [{ type: "text" as const, text: `Server "${filterServer}" not found. Connected servers: ${[...upstreams.keys()].join(", ")}` }],
+            isError: true,
+          };
+        }
+        // Server-specific help
+        const lines = [
+          `# Server: ${filterServer} (${upstream.config.type})`,
+          "",
+          `## Tools (${upstream.tools.length})`,
+          "",
+        ];
+        for (const tool of upstream.tools) {
+          lines.push(`### \`${namespaceTool(filterServer, tool.name)}\``);
+          if (tool.description) lines.push(tool.description);
+          if (tool.inputSchema) {
+            lines.push("");
+            lines.push("```json");
+            lines.push(JSON.stringify(tool.inputSchema, null, 2));
+            lines.push("```");
+          }
+          lines.push("");
+        }
+        return {
+          content: [{ type: "text" as const, text: lines.join("\n") }],
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: buildUsageGuide() }],
+      };
+    }
+
     const parsed = parseNamespacedTool(name);
     if (!parsed) {
       return {
-        content: [{ type: "text" as const, text: JSON.stringify({ error: `Unknown tool: ${name}. Tool names are prefixed with server name (e.g., "myserver__toolname").` }) }],
+        content: [{ type: "text" as const, text: JSON.stringify({ error: `Unknown tool: ${name}. Tool names are prefixed with server name (e.g., "myserver__toolname"). Call daemon_help for a full list.` }) }],
         isError: true,
       };
     }
