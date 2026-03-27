@@ -18,6 +18,7 @@
     "dev": "npx tsx src/index.ts",
     "dev:http": "npx tsx src/index.ts serve",
     "test:daemon": "node test/daemon-e2e.mjs",
+    "test:issue7": "node test/issue-7-multiline-args.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

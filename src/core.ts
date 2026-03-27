@@ -270,6 +270,8 @@ function transformToolSchema(tool: ToolSchema): ToolSchema {
     type: "object",
     description:
       "The upstream tool's arguments as a native JSON object (not a string). " +
+      "IMPORTANT: Must be single-line compact JSON — do not pretty-print with newlines or indentation, " +
+      "as the parameter encoding layer may serialize multiline content as a string instead of an object. " +
       "Use describe_tools to get the upstream tool's inputSchema, then pass " +
       "those fields here directly. Example: if the upstream tool expects " +
       '{owner: string, repo: string}, pass args: {"owner": "foo", "repo": "bar"}. ' +
@@ -321,6 +323,22 @@ function validateAndSerializeArgs(jsonStr: string): string {
       `not a pre-serialized string. Pass args as {"key": "value"}, not as '{"key": "value"}'. ` +
       `Parse error: ${(err as Error).message}. Input (first 200 chars): ${jsonStr.slice(0, 200)}`
     );
+  }
+
+  // Defensive unwrapping: if parsed is a string containing a JSON object,
+  // unwrap one level. This handles double-encoded args from Claude's tool calling
+  // infrastructure when multiline/pretty-printed JSON gets wrapped in string
+  // delimiters (e.g., "{\n  \"files\": [...]}" → {files: [...]}).
+  // See: https://github.com/luutuankiet/mcp-proxy-shim/issues/7
+  if (typeof parsed === "string") {
+    try {
+      const inner = JSON.parse(parsed);
+      if (inner !== null && typeof inner === "object" && !Array.isArray(inner)) {
+        parsed = inner;
+      }
+    } catch {
+      // Not valid JSON inside the string — fall through to error below
+    }
   }
 
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
