@@ -1,6 +1,6 @@
 # @luutuankiet/mcp-proxy-shim
 
-**MCP shim for [mcpproxy-go](https://github.com/smart-mcp-proxy/mcpproxy-go)** — eliminates `args_json` string escaping overhead for LLM clients. Supports **stdio** and **HTTP Streamable** transports.
+**MCP shim for [mcpproxy-go](https://github.com/smart-mcp-proxy/mcpproxy-go)** — eliminates `args_json` string escaping overhead for LLM clients. Supports **stdio**, **HTTP Streamable**, **daemon**, and **passthru** modes.
 
 ## The Problem
 
@@ -197,137 +197,144 @@ Each downstream client gets its own MCP session, but all sessions **share a sing
 | `/mcp` | DELETE | `?apikey=` | Session termination |
 | `/health` | GET | None | Health check (session count, uptime) |
 
-### Option C: Daemon Mode (multi-server MCP gateway)
+### Option C: Daemon Mode (REST + MCP gateway for cloud agents)
 
-Run a standalone gateway that connects to **multiple** MCP servers (stdio or HTTP) and exposes all their tools through a single HTTP endpoint. Pure passthrough — no schema transformation.
+Run as a REST gateway that connects to a **single mcpproxy-go upstream** and exposes both REST endpoints (for curl-based subagents) and a Streamable HTTP `/mcp` endpoint (for MCP clients).
 
-**Use case:** Cloud agents (claude.ai/code, Codespaces, etc.) that can't spawn MCP servers on the fly.
+**Use case:** Cloud agents (claude.ai/code, Codespaces, etc.) that can't spawn MCP servers on the fly, but can `curl`.
 
 ```
-Cloud Agent ──HTTP──▶ daemon (:3456) ──┬── stdio ──▶ github MCP
-                                       ├── stdio ──▶ filesystem MCP
-                                       └── HTTP  ──▶ remote API (with auth headers)
+Cloud Agent ──curl──> daemon (:3456) ──HTTP──> mcpproxy-go (upstream)
+             <── clean JSON <──────────<── MCP response
 ```
-
-#### Inline config
 
 ```bash
-MCP_SERVERS='{
-  "github": {
-    "type": "stdio",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-github"],
-    "env": { "GITHUB_TOKEN": "ghp_..." }
-  },
-  "my-api": {
-    "type": "streamableHttp",
-    "url": "https://api.example.com/mcp",
-    "headers": { "Authorization": "Bearer xxx", "X-Org-Id": "org_123" }
-  }
-}' npx @luutuankiet/mcp-proxy-shim daemon
+MCP_URL="https://your-proxy/mcp/?apikey=KEY" npx @luutuankiet/mcp-proxy-shim daemon
 ```
 
-#### Config file
+#### Daemon REST endpoints
 
-```bash
-MCP_CONFIG=./mcp-servers.json npx @luutuankiet/mcp-proxy-shim daemon
-```
-
-The config file supports three formats:
-- Flat: `{ "server-name": { "type": "stdio", ... } }`
-- Wrapped: `{ "servers": { "server-name": { ... } } }`
-- `.mcp.json` format: `{ "mcpServers": { "server-name": { ... } } }`
-
-#### How clients use it
-
-All upstream tools are **namespaced** with the server name as prefix:
-
-```
-github__get_file_contents    ← from the "github" server
-my-api__query                ← from the "my-api" server
-```
-
-A built-in `daemon_help` tool provides a full usage guide:
-
-```json
-{ "name": "daemon_help", "arguments": {} }
-```
-
-Returns connected servers, all tools with namespaced names, and calling examples. You can also filter to a specific server for full schemas:
-
-```json
-{ "name": "daemon_help", "arguments": { "server": "github" } }
-```
-
-The daemon also returns `instructions` in the MCP `initialize` response, so MCP clients that support server instructions will automatically know how to use it.
-
-#### Server config reference
-
-**Stdio servers** (spawn a local process):
-
-```json
-{
-  "type": "stdio",
-  "command": "npx",
-  "args": ["-y", "@modelcontextprotocol/server-github"],
-  "env": { "GITHUB_TOKEN": "ghp_..." },
-  "cwd": "/optional/working/directory"
-}
-```
-
-**HTTP Streamable servers** (connect to remote MCP):
-
-```json
-{
-  "type": "streamableHttp",
-  "url": "https://api.example.com/mcp",
-  "headers": {
-    "Authorization": "Bearer your-token",
-    "X-Custom-Header": "value"
-  }
-}
-```
-
-The `headers` field supports any custom HTTP headers — useful for authentication, org routing, or API versioning.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check + session info |
+| `/retrieve_tools` | POST | BM25 tool search `{ query }` |
+| `/describe_tools` | POST | Batch-hydrate full schemas `{ names: [...] }` |
+| `/call` | POST | Execute tool `{ method, name, args }` |
+| `/exec` | POST | Run code on upstream `{ code }` |
+| `/reinit` | POST | Force new upstream session |
+| `/mcp` | POST/GET/DELETE | Streamable HTTP MCP (backward compat) |
 
 #### Daemon environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_SERVERS` | — | JSON string with server configs (inline) |
-| `MCP_CONFIG` | — | Path to JSON config file (alternative to MCP_SERVERS) |
+| `MCP_URL` | **(required)** | mcpproxy-go StreamableHTTP endpoint |
 | `MCP_PORT` | `3456` | Port to listen on |
 | `MCP_HOST` | `0.0.0.0` | Host to bind to |
-| `MCP_APIKEY` | — (open) | Require `?apikey=KEY` on `/mcp` requests |
-| `https_proxy` | — | HTTPS proxy for HTTP upstream connections |
+| `MCP_APIKEY` | — (open) | Require `?apikey=KEY` on requests |
 
-#### Daemon endpoints
+### Option D: Passthru Mode (generic MCP→REST bridge)
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/mcp` | POST | MCP JSON-RPC (initialize, tools/list, tools/call) |
-| `/mcp` | GET | SSE stream reconnection |
-| `/mcp` | DELETE | Session termination |
-| `/health` | GET | Per-server status, tool counts, uptime |
+Connect to **any MCP server** (not just mcpproxy-go) and expose its tools as clean REST endpoints. Designed for MCP server development and testing — lets LLM agents consume any MCP server via simple `curl`.
 
-#### Production deployment
+**Use case:** You're building an MCP server and want Claude (or any LLM agent) to test it mid-session without restarting.
 
-```yaml
-# docker-compose.yml
-services:
-  mcp-daemon:
-    image: node:22-slim
-    command: npx -y @luutuankiet/mcp-proxy-shim daemon
-    environment:
-      - MCP_CONFIG=/config/servers.json
-      - MCP_APIKEY=your-secret
-    ports:
-      - "3456:3456"
-    volumes:
-      - ./mcp-servers.json:/config/servers.json:ro
+```
+Agent ──curl──> passthru (:3456) ──stdio/HTTP──> your MCP server
+             <── clean JSON      <── MCP response (unwrapped)
 ```
 
----
+#### Stdio (spawn and manage the server process)
+
+```bash
+npx @luutuankiet/mcp-proxy-shim passthru -- npx tsx src/index.ts
+
+# With extra env vars
+npx @luutuankiet/mcp-proxy-shim passthru --env API_KEY=xxx -- python server.py
+
+# With working directory
+npx @luutuankiet/mcp-proxy-shim passthru --cwd ./my-server -- npm start
+```
+
+#### HTTP Streamable (connect to running server)
+
+```bash
+npx @luutuankiet/mcp-proxy-shim passthru --url http://localhost:3000/mcp
+
+# With auth headers
+npx @luutuankiet/mcp-proxy-shim passthru --url http://localhost:3000/mcp --header "Authorization: Bearer xxx"
+```
+
+#### SSE (legacy transport)
+
+```bash
+npx @luutuankiet/mcp-proxy-shim passthru --url http://localhost:3000/sse --transport sse
+```
+
+#### Config file
+
+```bash
+npx @luutuankiet/mcp-proxy-shim passthru --config server.json
+```
+
+Config file formats:
+```json
+// Stdio
+{"type": "stdio", "command": "npx", "args": ["tsx", "src/index.ts"], "env": {"API_KEY": "xxx"}}
+
+// HTTP Streamable
+{"type": "streamableHttp", "url": "http://localhost:3000/mcp", "headers": {"Authorization": "Bearer xxx"}}
+
+// SSE
+{"type": "sse", "url": "http://localhost:3000/sse", "headers": {}}
+```
+
+#### Passthru REST endpoints
+
+| Endpoint | Method | Description | Example |
+|----------|--------|-------------|----------|
+| `/health` | GET | Server status + transport info | `curl localhost:3456/health` |
+| `/tools` | GET | Dehydrated tool list (name, description snippet, param summary) | `curl localhost:3456/tools` |
+| `/tools?q=keyword` | GET | Search tools by name/description | `curl "localhost:3456/tools?q=read"` |
+| `/tools/:name` | GET | Full tool schema with `inputSchema` | `curl localhost:3456/tools/read_files` |
+| `/call/:name` | POST | Invoke a tool with native JSON args | `curl -X POST localhost:3456/call/read_files -d '{"args": {"files": [...]}}'` |
+| `/restart` | POST | Restart upstream MCP connection | `curl -X POST localhost:3456/restart` |
+
+#### Dehydrated tool listing
+
+The `/tools` endpoint returns token-efficient tool summaries:
+
+```json
+{
+  "tools": [
+    {
+      "name": "read_files",
+      "description": "Read the contents of multiple files simultaneously...",
+      "params": "files: object[]* | compact: boolean"
+    }
+  ],
+  "count": 10,
+  "hint": "GET /tools/{name} for full inputSchema"
+}
+```
+
+Params use `name: type` format with `*` for required fields. Use `/tools/:name` to get the full `inputSchema` when needed.
+
+#### Token economics: passthru vs mcpproxy-go path
+
+| Metric | Via mcpproxy-go daemon | Via passthru | Savings |
+|--------|----------------------|--------------|--------|
+| Round-trips to test one tool | 3 (retrieve + describe + call) | 1-2 (optional list + call) | **50-66%** |
+| Request tokens per call | ~300 | ~50 | **83%** |
+| Tool name length | `server_at_slash_path__tool_name` | `tool_name` (native) | **~85% shorter** |
+| Response unwrapping | Automatic | Automatic | Same |
+
+#### Passthru environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_PORT` | `3456` | Port to listen on |
+| `MCP_HOST` | `0.0.0.0` | Host to bind to |
 
 ## Why Not `/mcp/all`?
 
@@ -385,15 +392,15 @@ We tested this live: added a YNAB financial tool mid-session → 43 new tools ap
 
 ### Transport Modes
 
-| Feature | Stdio | HTTP Streamable (`serve`) | Daemon (`daemon`) |
-|---------|-------|--------------------------|-------------------|
-| Use case | Local MCP client (Claude Code, Cursor) | Remote agents, single upstream | Cloud agents, multi-server gateway |
-| Connection | stdin/stdout | HTTP on `/mcp` | HTTP on `/mcp` |
-| Upstreams | Single (mcpproxy-go) | Single (mcpproxy-go) | Multiple (stdio + HTTP) |
-| Schema transforms | `args_json` → `args` | `args_json` → `args` | None (pure passthrough) |
-| Auth | N/A (local process) | Optional `?apikey=` | Optional `?apikey=` |
-| Multi-client | Single | Multiple sessions | Multiple sessions |
-| Custom headers | N/A | N/A | Per-upstream `headers` config |
+| Feature | Stdio | HTTP Streamable (`serve`) | Daemon (`daemon`) | Passthru (`passthru`) |
+|---------|-------|--------------------------|-------------------|----------------------|
+| Use case | Local MCP client (Claude Code, Cursor) | Remote agents, single upstream | Cloud agents, curl-based subagents | MCP server dev/testing |
+| Connection | stdin/stdout | HTTP on `/mcp` | HTTP REST + `/mcp` | HTTP REST only |
+| Upstream | Single (mcpproxy-go) | Single (mcpproxy-go) | Single (mcpproxy-go) | Any MCP server (stdio/HTTP/SSE) |
+| Schema transforms | `args_json` → `args` | `args_json` → `args` | `args_json` → `args` | None (native schemas) |
+| Auth | N/A (local process) | Optional `?apikey=` | Optional `?apikey=` | None (dev tool) |
+| Multi-client | Single | Multiple sessions | Multiple sessions | Single |
+| Response unwrapping | N/A | N/A | `deepUnwrapResult` | `deepUnwrapResult` |
 
 ### Session Management
 
