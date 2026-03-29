@@ -1,4 +1,16 @@
 #!/usr/bin/env node
+
+// ---------------------------------------------------------------------------
+// TLS: Default to insecure mode for sandbox/corporate proxy compatibility.
+// Egress proxies (Anthropic sandbox, corporate MITM) present their own certs
+// that Node.js rejects. Setting this globally before any imports ensures all
+// fetch() calls, undici ProxyAgent, and MCP SDK transports work through
+// TLS-intercepting proxies without manual NODE_TLS_REJECT_UNAUTHORIZED=0.
+// ---------------------------------------------------------------------------
+if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
+
 /**
  * MCP Proxy Shim — Unified Entry Point
  *

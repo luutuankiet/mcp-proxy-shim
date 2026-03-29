@@ -41,6 +41,12 @@
  *   MCP_HOST     Host to bind to (default: 0.0.0.0)
  */
 
+// TLS: Ensure insecure mode is set when passthru.ts is imported directly
+// (not through index.ts). Passthru connects to arbitrary MCP servers over HTTP/SSE.
+if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
+
 import http from "node:http";
 import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";

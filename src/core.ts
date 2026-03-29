@@ -12,6 +12,12 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
+// TLS: Ensure insecure mode is set when core.ts is imported directly
+// (not through index.ts). Covers stdio.ts, http-server.ts direct imports.
+if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
+
 // Proxy support — Node 22 built-in undici honors https_proxy via ProxyAgent
 import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
