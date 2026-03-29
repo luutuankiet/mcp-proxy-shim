@@ -514,12 +514,21 @@ function jsonResponse(
   res: http.ServerResponse,
   status: number,
   body: unknown,
+  req?: http.IncomingMessage,
 ): void {
+  // Format control via query param: ?pretty (default) or ?compact
+  // Agents that want minimal tokens use ?compact, humans get pretty by default
+  let indent: number | undefined = 2;
+  if (req) {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (url.searchParams.has("compact")) indent = undefined;
+    if (url.searchParams.get("pretty") === "false") indent = undefined;
+  }
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
   });
-  res.end(JSON.stringify(body, null, 2));
+  res.end(JSON.stringify(body, null, indent));
 }
 
 function extractToolName(pathname: string, prefix: string): string {
@@ -532,13 +541,17 @@ const startTime = Date.now();
 let callCount = 0;
 
 async function handleHealth(
-  _req: http.IncomingMessage,
+  req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
   const transportType = serverConfig.type;
-  const target = serverConfig.type === "stdio"
+  let target = serverConfig.type === "stdio"
     ? `${serverConfig.command} ${(serverConfig.args || []).join(" ")}`
     : (serverConfig as HttpConfig).url;
+  // Mask credentials in URL (e.g., ?apikey=xxx → ?apikey=***)
+  target = target.replace(/apikey=[^&\s]+/gi, "apikey=***")
+    .replace(/token=[^&\s]+/gi, "token=***")
+    .replace(/\/\/([^:]+):[^@]+@/g, "//$1:***@");
 
   jsonResponse(res, 200, {
     ok: !!client,
@@ -548,7 +561,7 @@ async function handleHealth(
     uptime: Math.round((Date.now() - startTime) / 1000),
     connected_for: client ? Math.round((Date.now() - connectTime) / 1000) : null,
     callCount,
-  });
+  }, req);
 }
 
 async function handleListTools(
@@ -565,7 +578,7 @@ async function handleListTools(
     total: toolIndex.size,
     ...(query ? { query } : {}),
     hint: "GET /tools/{name} for full inputSchema",
-  });
+  }, req);
 }
 
 async function handleGetTool(
@@ -578,9 +591,9 @@ async function handleGetTool(
     return jsonResponse(res, 404, {
       error: `Tool not found: ${toolName}`,
       available: Array.from(toolIndex.keys()),
-    });
+    }, _req);
   }
-  jsonResponse(res, 200, tool);
+  jsonResponse(res, 200, tool, _req);
 }
 
 async function handleCallTool(
@@ -640,7 +653,7 @@ async function handleCallTool(
     // Check if the upstream reported an error
     const isError = (result as Record<string, unknown>)?.isError === true;
 
-    jsonResponse(res, isError ? 422 : 200, unwrapped);
+    jsonResponse(res, isError ? 422 : 200, unwrapped, req);
   } catch (err) {
     jsonResponse(res, 500, {
       error: "Tool call failed",
