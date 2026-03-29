@@ -6,6 +6,7 @@
  *   (default)  stdio transport — for local MCP clients (Claude Code, Cursor, etc.)
  *   serve      HTTP Streamable transport — for remote agents over HTTP
  *   daemon     REST + MCP gateway — single upstream via mcpproxy-go, exposes REST + /mcp
+ *   passthru   Generic MCP→REST bridge — connect to any MCP server for dev/testing
  *
  * Usage:
  *   # Stdio mode (default) — single upstream via mcpproxy-go
@@ -55,6 +56,24 @@ if (subcommand === "--help" || subcommand === "-h") {
   console.log("  POST /exec            { code }");
   console.log("  POST /reinit          Force new upstream session");
   console.log("  POST /mcp             Streamable HTTP (backward compat)");
+  console.log("");
+  console.log("Passthru mode (generic MCP→REST bridge):");
+  console.log("  passthru -- <command> [args]   Spawn a stdio MCP server");
+  console.log("  passthru --url <URL>           Connect to HTTP Streamable server");
+  console.log("  passthru --url <URL> --transport sse   Connect to SSE server");
+  console.log("  passthru --config <file>       Load server config from JSON");
+  console.log("");
+  console.log("Passthru options:");
+  console.log("  --env KEY=VAL     Extra env vars for stdio (repeatable)");
+  console.log("  --header K: V     Extra headers for HTTP/SSE (repeatable)");
+  console.log("  --cwd <dir>       Working directory for stdio server");
+  console.log("");
+  console.log("Passthru REST endpoints:");
+  console.log("  GET  /health          Server status + transport info");
+  console.log("  GET  /tools           Dehydrated tool list (?q=keyword to search)");
+  console.log("  GET  /tools/:name     Full tool schema with inputSchema");
+  console.log("  POST /call/:name      Invoke tool. Body: {args: {...}}");
+  console.log("  POST /restart         Restart upstream connection");
   process.exit(0);
 }
 
@@ -64,12 +83,16 @@ if (subcommand === "serve") {
 } else if (subcommand === "daemon") {
   // Dynamic import — loads daemon mode (no core.ts dependency)
   import("./daemon.js");
+} else if (subcommand === "passthru") {
+  // Dynamic import — generic MCP→REST bridge (no core.ts dependency)
+  import("./passthru.js");
 } else if (subcommand) {
   console.error(`Unknown subcommand: "${subcommand}"`);
-  console.error("Usage: mcp-proxy-shim [serve|daemon]");
+  console.error("Usage: mcp-proxy-shim [serve|daemon|passthru]");
   console.error("  (no args)  stdio transport (default)");
   console.error("  serve      HTTP Streamable server");
-  console.error("  daemon     Multi-server MCP gateway");
+  console.error("  daemon     REST + MCP gateway (mcpproxy-go)");
+  console.error("  passthru   Generic MCP→REST bridge");
   process.exit(1);
 } else {
   // Default: stdio mode
