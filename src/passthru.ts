@@ -104,6 +104,14 @@ const { ProxyAgent } = _require("undici") as { ProxyAgent: new (url: string) => 
 const PROXY_URL = process.env.https_proxy || process.env.HTTPS_PROXY || "";
 const proxyDispatcher = PROXY_URL ? new ProxyAgent(PROXY_URL) : undefined;
 
+// Proxy-aware fetch wrapper for SDK transports (initialize + listTools).
+// The SDK accepts opts.fetch — inject proxyDispatcher so connections
+// route through https_proxy in sandboxed environments.
+const proxyFetch: typeof fetch | undefined = proxyDispatcher
+  ? (url: string | URL | Request, init?: RequestInit) =>
+      fetch(url, { ...init, dispatcher: proxyDispatcher } as RequestInit)
+  : undefined;
+
 let httpSessionId: string | null = null;
 let httpReqId = 0;
 
@@ -360,9 +368,10 @@ function createTransport(config: ServerConfig): AnyTransport {
     log(`SSE: ${config.url}`);
     return new SSEClientTransport(
       new URL(config.url),
-      config.headers
-        ? { requestInit: { headers: config.headers } }
-        : undefined,
+      {
+        ...(config.headers ? { requestInit: { headers: config.headers } } : {}),
+        ...(proxyFetch ? { fetch: proxyFetch } : {}),
+      },
     );
   }
 
@@ -370,9 +379,10 @@ function createTransport(config: ServerConfig): AnyTransport {
   log(`HTTP Streamable: ${config.url}`);
   return new StreamableHTTPClientTransport(
     new URL(config.url),
-    config.headers
-      ? { requestInit: { headers: config.headers } }
-      : undefined,
+    {
+      ...(config.headers ? { requestInit: { headers: config.headers } } : {}),
+      ...(proxyFetch ? { fetch: proxyFetch } : {}),
+    },
   );
 }
 
