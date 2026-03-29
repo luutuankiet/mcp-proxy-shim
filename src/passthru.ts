@@ -84,6 +84,109 @@ interface DehydratedTool {
   params: string;
 }
 
+
+// ── Raw fetch for HTTP tool calls (workaround for SDK #396) ────────
+// The SDK's StreamableHTTPClientTransport has broken session multiplexing
+// that causes 2nd+ callTool to hang. For HTTP/SSE upstreams, we use the
+// SDK only for initialize + tools/list, then raw fetch for tools/call.
+// Stdio transport is unaffected — uses SDK client directly.
+
+import { createRequire } from "node:module";
+const _require = createRequire(import.meta.url);
+const { ProxyAgent } = _require("undici") as { ProxyAgent: new (url: string) => object };
+
+const PROXY_URL = process.env.https_proxy || process.env.HTTPS_PROXY || "";
+const proxyDispatcher = PROXY_URL ? new ProxyAgent(PROXY_URL) : undefined;
+
+let httpSessionId: string | null = null;
+let httpReqId = 0;
+
+async function rawMcpRequest(
+  url: string,
+  method: string,
+  params: Record<string, unknown>,
+  headers?: Record<string, string>,
+): Promise<Record<string, unknown> | null> {
+  const body: Record<string, unknown> = {
+    jsonrpc: "2.0",
+    method,
+    params,
+    id: ++httpReqId,
+  };
+
+  const reqHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    ...(headers || {}),
+  };
+  if (httpSessionId) {
+    reqHeaders["Mcp-Session-Id"] = httpSessionId;
+  }
+
+  const fetchOpts: RequestInit & { dispatcher?: object } = {
+    method: "POST",
+    headers: reqHeaders,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120_000),
+  };
+  if (proxyDispatcher) {
+    fetchOpts.dispatcher = proxyDispatcher;
+  }
+
+  const resp = await fetch(url, fetchOpts as RequestInit);
+
+  const sid = resp.headers.get("mcp-session-id");
+  if (sid) httpSessionId = sid;
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${text.slice(0, 500)}`);
+  }
+
+  const contentType = resp.headers.get("content-type") || "";
+  if (contentType.includes("text/event-stream")) {
+    // Stream-parse SSE events — the stream may never close (SDK #396),
+    // so we read events incrementally and resolve on first JSON-RPC response.
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete SSE events (terminated by double newline)
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || ""; // Keep incomplete event in buffer
+
+        for (const event of events) {
+          for (const line of event.split("\n")) {
+            if (line.startsWith("data: ")) {
+              const data = line.slice(6);
+              try {
+                const parsed = JSON.parse(data);
+                // Got a JSON-RPC response — cancel stream and return
+                reader.cancel().catch(() => {});
+                return parsed;
+              } catch {
+                // Not JSON, continue
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      reader.cancel().catch(() => {});
+      throw err;
+    }
+    throw new Error("SSE stream ended without JSON-RPC response");
+  }
+
+  return (await resp.json()) as Record<string, unknown>;
+}
+
 // ── Logging ────────────────────────────────────────────────────────
 
 function log(...args: unknown[]) {
@@ -274,6 +377,9 @@ let transport: AnyTransport | null = null;
 let toolIndex: Map<string, ToolSchema> = new Map();
 let serverConfig: ServerConfig;
 let connectTime: number = 0;
+let useRawFetch = false;
+let httpUrl: string | null = null;
+let httpHeaders: Record<string, string> = {};
 
 async function connectServer(config: ServerConfig): Promise<void> {
   transport = createTransport(config);
@@ -290,9 +396,26 @@ async function connectServer(config: ServerConfig): Promise<void> {
     { capabilities: {} },
   );
 
+  // For HTTP/SSE transports, track URL for raw fetch workaround (SDK #396)
+  if (config.type !== "stdio") {
+    useRawFetch = true;
+    httpUrl = (config as HttpConfig).url;
+    httpHeaders = (config as HttpConfig).headers || {};
+  } else {
+    useRawFetch = false;
+    httpUrl = null;
+    httpHeaders = {};
+  }
+
   log("Connecting to upstream MCP server...");
   await client.connect(transport);
   connectTime = Date.now();
+
+  // Capture session ID from transport for raw fetch
+  if (useRawFetch && transport instanceof StreamableHTTPClientTransport) {
+    httpSessionId = (transport as any).sessionId || null;
+  }
+
   log("Connected. Listing tools...");
 
   await refreshTools();
@@ -485,15 +608,37 @@ async function handleCallTool(
 
   try {
     callCount++;
-    const result = await client.callTool({
-      name: toolName,
-      arguments: toolArgs,
-    });
+    let result: unknown;
+
+    if (useRawFetch && httpUrl) {
+      // Raw fetch workaround for SDK #396 (StreamableHTTPClientTransport
+      // hangs on 2nd+ callTool due to broken session multiplexing)
+      const resp = await rawMcpRequest(httpUrl, "tools/call", {
+        name: toolName,
+        arguments: toolArgs,
+      }, httpHeaders);
+      if (!resp) {
+        return jsonResponse(res, 502, { error: "No response from upstream" });
+      }
+      if ((resp as any).error) {
+        return jsonResponse(res, 502, {
+          error: "upstream error",
+          detail: (resp as any).error,
+        });
+      }
+      result = (resp as any).result ?? resp;
+    } else {
+      // Stdio transport — SDK client works fine
+      result = await client!.callTool({
+        name: toolName,
+        arguments: toolArgs,
+      });
+    }
 
     const unwrapped = deepUnwrapResult(result);
 
     // Check if the upstream reported an error
-    const isError = (result as Record<string, unknown>).isError === true;
+    const isError = (result as Record<string, unknown>)?.isError === true;
 
     jsonResponse(res, isError ? 422 : 200, unwrapped);
   } catch (err) {
