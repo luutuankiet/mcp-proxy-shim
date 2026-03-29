@@ -516,13 +516,13 @@ function jsonResponse(
   body: unknown,
   req?: http.IncomingMessage,
 ): void {
-  // Format control via query param: ?pretty (default) or ?compact
-  // Agents that want minimal tokens use ?compact, humans get pretty by default
-  let indent: number | undefined = 2;
+  // Format control: compact by default (token-efficient for agents).
+  // Add ?pretty to any endpoint for indented human-readable output.
+  let indent: number | undefined = undefined;
   if (req) {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    if (url.searchParams.has("compact")) indent = undefined;
-    if (url.searchParams.get("pretty") === "false") indent = undefined;
+    if (url.searchParams.has("pretty")) indent = 2;
+    
   }
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -577,7 +577,7 @@ async function handleListTools(
     count: tools.length,
     total: toolIndex.size,
     ...(query ? { query } : {}),
-    hint: "GET /tools/{name} for full inputSchema. Add ?compact to any endpoint for single-line JSON.",
+    hint: "GET /tools/{name} for full inputSchema. Add ?pretty to any endpoint for indented JSON.",
   }, req);
 }
 
@@ -755,7 +755,7 @@ export async function main() {
           "POST /call/:name": "Invoke tool. Body: {args: {...}}",
           "POST /restart": "Restart upstream connection",
         },
-        format: "Add ?compact to any endpoint for single-line JSON (saves tokens). Default: pretty-printed.",
+        format: "Add ?pretty to any endpoint for indented JSON.(saves tokens). Default: pretty-printed.",
       });
     };
 
