@@ -577,7 +577,7 @@ async function handleListTools(
     count: tools.length,
     total: toolIndex.size,
     ...(query ? { query } : {}),
-    hint: "GET /tools/{name} for full inputSchema",
+    hint: "GET /tools/{name} for full inputSchema. Add ?compact to any endpoint for single-line JSON.",
   }, req);
 }
 
@@ -755,6 +755,7 @@ export async function main() {
           "POST /call/:name": "Invoke tool. Body: {args: {...}}",
           "POST /restart": "Restart upstream connection",
         },
+        format: "Add ?compact to any endpoint for single-line JSON (saves tokens). Default: pretty-printed.",
       });
     };
 
