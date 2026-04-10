@@ -494,12 +494,24 @@ function toStructuredContent(value: unknown): Record<string, unknown> {
 }
 
 function unwrapAndRewrap(result: unknown): { content: Array<Record<string, unknown>>; structuredContent?: Record<string, unknown> } {
-  // Preserve non-text content types (ImageContent, AudioContent) as-is.
+  // Preserve non-text content types (ImageContent, AudioContent) in content as-is.
   // These must flow through the proxy chain without re-serialization so
   // vision-capable clients can render images natively.
-  // structuredContent cannot represent binary data, so we skip it here.
+  // For structuredContent: extract text portions only (binary can't be represented).
   if (hasNonTextContent(result)) {
-    return result as { content: Array<Record<string, unknown>> };
+    const r = result as { content: Array<Record<string, unknown>> };
+    const textParts = r.content
+      .filter((c) => c.type === "text" && typeof c.text === "string")
+      .map((c) => c.text as string);
+    if (textParts.length > 0) {
+      return {
+        ...r,
+        structuredContent: toStructuredContent(
+          textParts.length === 1 ? textParts[0] : textParts.join("\n---\n"),
+        ),
+      };
+    }
+    return r;
   }
 
   const unwrapped = deepUnwrapResult(result);
