@@ -481,26 +481,44 @@ function hasNonTextContent(obj: unknown): boolean {
   });
 }
 
-function unwrapAndRewrap(result: unknown): { content: Array<Record<string, unknown>> } {
+/**
+ * Convert a value to a structuredContent-compatible JSON object.
+ * MCP 2025-03-26+ spec requires structuredContent to be a JSON object.
+ * Primitives and arrays are wrapped in { result: value }.
+ */
+function toStructuredContent(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return { result: value };
+}
+
+function unwrapAndRewrap(result: unknown): { content: Array<Record<string, unknown>>; structuredContent?: Record<string, unknown> } {
   // Preserve non-text content types (ImageContent, AudioContent) as-is.
   // These must flow through the proxy chain without re-serialization so
   // vision-capable clients can render images natively.
+  // structuredContent cannot represent binary data, so we skip it here.
   if (hasNonTextContent(result)) {
     return result as { content: Array<Record<string, unknown>> };
   }
 
   const unwrapped = deepUnwrapResult(result);
+  const structuredContent = toStructuredContent(unwrapped);
+
   if (isMcpContentWrapper(unwrapped)) {
-    return unwrapped as { content: Array<{ type: "text"; text: string }> };
+    return {
+      ...(unwrapped as { content: Array<{ type: "text"; text: string }> }),
+      structuredContent,
+    };
   }
   const text = typeof unwrapped === "string" ? unwrapped : JSON.stringify(unwrapped);
-  return { content: [{ type: "text", text }] };
+  return { content: [{ type: "text", text }], structuredContent };
 }
 
 export function compactRetrieveTools(
   unwrapped: unknown,
   args: Record<string, unknown>,
-): { content: Array<{ type: "text"; text: string }> } {
+): { content: Array<{ type: "text"; text: string }>; structuredContent?: Record<string, unknown> } {
   const compact = args.compact !== false;
   const limit = typeof args.limit === "number" ? args.limit : 0;
 
@@ -545,7 +563,7 @@ export function compactRetrieveTools(
     output = unwrapped;
   }
   const text = typeof output === "string" ? output : JSON.stringify(output);
-  return { content: [{ type: "text", text }] };
+  return { content: [{ type: "text", text }], structuredContent: toStructuredContent(output) };
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +780,7 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
 
       return {
         content: [{ type: "text" as const, text: JSON.stringify(results) }],
+        structuredContent: toStructuredContent(results),
       };
     }
 
