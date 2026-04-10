@@ -494,24 +494,12 @@ function toStructuredContent(value: unknown): Record<string, unknown> {
 }
 
 function unwrapAndRewrap(result: unknown): { content: Array<Record<string, unknown>>; structuredContent?: Record<string, unknown> } {
-  // Preserve non-text content types (ImageContent, AudioContent) in content as-is.
-  // These must flow through the proxy chain without re-serialization so
-  // vision-capable clients can render images natively.
-  // For structuredContent: extract text portions only (binary can't be represented).
+  // Non-text content (ImageContent, AudioContent) — NO structuredContent.
+  // Reason: Claude Code sends ONLY structuredContent to the model when present,
+  // ignoring the content array. If we add text-only structuredContent here,
+  // the model loses access to ImageContent blocks. Model image access > TUI display.
   if (hasNonTextContent(result)) {
-    const r = result as { content: Array<Record<string, unknown>> };
-    const textParts = r.content
-      .filter((c) => c.type === "text" && typeof c.text === "string")
-      .map((c) => c.text as string);
-    if (textParts.length > 0) {
-      return {
-        ...r,
-        structuredContent: toStructuredContent(
-          textParts.length === 1 ? textParts[0] : textParts.join("\n---\n"),
-        ),
-      };
-    }
-    return r;
+    return result as { content: Array<Record<string, unknown>> };
   }
 
   const unwrapped = deepUnwrapResult(result);
