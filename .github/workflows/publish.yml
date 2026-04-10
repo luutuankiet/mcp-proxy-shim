@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 jobs:
@@ -26,6 +26,23 @@ jobs:
       - name: Verify package contents
         run: npm pack --dry-run
 
+  release:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create GitHub Release with auto-generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
+
   publish:
     runs-on: ubuntu-latest
     needs: test
@@ -41,8 +58,6 @@ jobs:
           node-version: 22
           # NOTE: no registry-url — it injects NODE_AUTH_TOKEN placeholder
           # which poisons OIDC auth (actions/setup-node#1440)
-      - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@latest
       - name: Install dependencies
         run: npm ci
       - name: Build
@@ -66,7 +81,9 @@ jobs:
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish to npm (OIDC provenance)
-        run: npm publish --access public --provenance --tag ${{ steps.dist-tag.outputs.tag }}
+        # npm install -g npm@latest breaks on Node 22.22.2 (MODULE_NOT_FOUND promise-retry)
+        # npx runs latest npm without corrupting the global install
+        run: npx -y npm@latest publish --access public --provenance --tag ${{ steps.dist-tag.outputs.tag }}
 
   preview:
     name: Preview (pkg-pr-new)
