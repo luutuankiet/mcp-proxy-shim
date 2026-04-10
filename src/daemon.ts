@@ -32,7 +32,7 @@
  *   MCP_URL="https://proxy.example.com/mcp/?apikey=KEY" npx @luutuankiet/mcp-proxy-shim daemon
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import http from "node:http";
@@ -131,11 +131,66 @@ function jsonResponse(
 }
 
 /**
+ * Image content directory for daemon mode.
+ * ImageContent blocks are written to disk so curl-based agents can
+ * use local Read to view them natively (token-efficient vs inline base64).
+ */
+const IMAGE_DIR = join(process.env.TMPDIR || "/tmp", "mcp-images");
+
+const MIME_TO_EXT: Record<string, string> = {
+  "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+  "image/webp": ".webp", "image/svg+xml": ".svg", "image/bmp": ".bmp",
+  "image/tiff": ".tiff", "image/x-icon": ".ico",
+};
+
+/**
+ * Write an ImageContent block to disk, return a text description with the file path.
+ * The agent can then use local Read tool to view the image natively.
+ */
+function writeImageToFile(block: Record<string, unknown>): string {
+  try {
+    mkdirSync(IMAGE_DIR, { recursive: true });
+    const mime = (block.mimeType as string) || "image/png";
+    const ext = MIME_TO_EXT[mime] || ".png";
+    const filename = `img_${randomUUID().slice(0, 8)}${ext}`;
+    const filepath = join(IMAGE_DIR, filename);
+    const data = Buffer.from(block.data as string, "base64");
+    writeFileSync(filepath, data);
+    const sizeKB = (data.length / 1024).toFixed(1);
+    return `[Image saved: ${filepath} (${mime}, ${sizeKB}KB)]\nUse your local Read tool to view this image natively.`;
+  } catch (err) {
+    log("writeImageToFile error:", (err as Error).message);
+    return `[Image: ${(block.mimeType as string) || "image/*"}, ${((block.data as string) || "").length} bytes base64 — failed to write to disk]`;
+  }
+}
+
+/**
+ * Process unwrapped result: replace ImageContent blocks with file paths.
+ * Text content passes through unchanged.
+ */
+function materializeImages(unwrapped: unknown): unknown {
+  if (!Array.isArray(unwrapped)) return unwrapped;
+  const hasImage = unwrapped.some(
+    (item) => typeof item === "object" && item !== null && (item as Record<string, unknown>).type === "image",
+  );
+  if (!hasImage) return unwrapped;
+
+  return unwrapped.map((item) => {
+    if (typeof item === "object" && item !== null && (item as Record<string, unknown>).type === "image") {
+      return writeImageToFile(item as Record<string, unknown>);
+    }
+    return item;
+  });
+}
+
+/**
  * Unwrap an MCP tools/call response to clean JSON for REST consumers.
  * Parses content[0].text and JSON.parse if possible.
+ * ImageContent blocks are written to /tmp/mcp-images/ and replaced with file paths.
  */
 function unwrapForRest(result: unknown): unknown {
-  return deepUnwrapResult(result);
+  const unwrapped = deepUnwrapResult(result);
+  return materializeImages(unwrapped);
 }
 
 // ---------------------------------------------------------------------------
