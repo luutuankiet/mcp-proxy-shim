@@ -467,7 +467,28 @@ export function deepUnwrapResult(result: unknown): unknown {
   );
 }
 
-function unwrapAndRewrap(result: unknown): { content: Array<{ type: "text"; text: string }> } {
+/**
+ * Check if an MCP result contains non-text content blocks (image, audio, etc.).
+ * These must be passed through as-is to preserve native rendering for vision-capable clients.
+ */
+function hasNonTextContent(obj: unknown): boolean {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  const o = obj as Record<string, unknown>;
+  if (!Array.isArray(o.content) || o.content.length === 0) return false;
+  return o.content.some((c: unknown) => {
+    const item = c as Record<string, unknown>;
+    return item?.type && item.type !== "text";
+  });
+}
+
+function unwrapAndRewrap(result: unknown): { content: Array<Record<string, unknown>> } {
+  // Preserve non-text content types (ImageContent, AudioContent) as-is.
+  // These must flow through the proxy chain without re-serialization so
+  // vision-capable clients can render images natively.
+  if (hasNonTextContent(result)) {
+    return result as { content: Array<Record<string, unknown>> };
+  }
+
   const unwrapped = deepUnwrapResult(result);
   if (isMcpContentWrapper(unwrapped)) {
     return unwrapped as { content: Array<{ type: "text"; text: string }> };
