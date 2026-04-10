@@ -52,7 +52,8 @@ import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+// SSE legacy transport removed — only stdio and HTTP Streamable supported.
+// (Streamable HTTP responses may still use SSE format internally — handled in rawMcpRequest.)
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -65,7 +66,7 @@ interface StdioConfig {
 }
 
 interface HttpConfig {
-  type: "streamableHttp" | "sse";
+  type: "streamableHttp";
   url: string;
   headers?: Record<string, string>;
 }
@@ -281,10 +282,7 @@ function parseArgs(): ServerConfig {
     const url = args[urlIdx + 1];
 
     // Parse --transport (default: streamableHttp)
-    const transportIdx = args.indexOf("--transport");
-    const transport = transportIdx !== -1 && args[transportIdx + 1] === "sse"
-      ? "sse" as const
-      : "streamableHttp" as const;
+    const transport = "streamableHttp" as const;
 
     // Parse --header flags (repeatable)
     const headers: Record<string, string> = {};
@@ -350,7 +348,7 @@ function parseArgs(): ServerConfig {
 
 // ── Transport Factory ──────────────────────────────────────────────
 
-type AnyTransport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport;
+type AnyTransport = StdioClientTransport | StreamableHTTPClientTransport;
 
 function createTransport(config: ServerConfig): AnyTransport {
   if (config.type === "stdio") {
@@ -364,18 +362,6 @@ function createTransport(config: ServerConfig): AnyTransport {
     });
   }
 
-  if (config.type === "sse") {
-    log(`SSE: ${config.url}`);
-    return new SSEClientTransport(
-      new URL(config.url),
-      {
-        ...(config.headers ? { requestInit: { headers: config.headers } } : {}),
-        ...(proxyFetch ? { fetch: proxyFetch } : {}),
-      },
-    );
-  }
-
-  // Default: streamableHttp
   log(`HTTP Streamable: ${config.url}`);
   return new StreamableHTTPClientTransport(
     new URL(config.url),

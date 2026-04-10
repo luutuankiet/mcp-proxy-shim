@@ -72,12 +72,11 @@ if (subcommand === "--help" || subcommand === "-h") {
   console.log("Passthru mode (generic MCP→REST bridge):");
   console.log("  passthru -- <command> [args]   Spawn a stdio MCP server");
   console.log("  passthru --url <URL>           Connect to HTTP Streamable server");
-  console.log("  passthru --url <URL> --transport sse   Connect to SSE server");
   console.log("  passthru --config <file>       Load server config from JSON");
   console.log("");
   console.log("Passthru options:");
   console.log("  --env KEY=VAL     Extra env vars for stdio (repeatable)");
-  console.log("  --header K: V     Extra headers for HTTP/SSE (repeatable)");
+  console.log("  --header K: V     Extra headers for HTTP (repeatable)");
   console.log("  --cwd <dir>       Working directory for stdio server");
   console.log("");
   console.log("Passthru REST endpoints:");

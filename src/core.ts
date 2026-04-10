@@ -493,6 +493,20 @@ function toStructuredContent(value: unknown): Record<string, unknown> {
   return { result: value };
 }
 
+/**
+ * Extract structuredContent from an upstream result if present.
+ * The upstream (or mcpproxy-go) may already provide structuredContent
+ * — we should prefer it over computing our own from the text payload.
+ */
+function extractUpstreamSC(result: unknown): Record<string, unknown> | undefined {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return undefined;
+  const r = result as Record<string, unknown>;
+  if (r.structuredContent && typeof r.structuredContent === "object" && !Array.isArray(r.structuredContent)) {
+    return r.structuredContent as Record<string, unknown>;
+  }
+  return undefined;
+}
+
 function unwrapAndRewrap(result: unknown): { content: Array<Record<string, unknown>>; structuredContent?: Record<string, unknown> } {
   // Non-text content (ImageContent, AudioContent) — NO structuredContent.
   // Reason: Claude Code sends ONLY structuredContent to the model when present,
@@ -502,8 +516,11 @@ function unwrapAndRewrap(result: unknown): { content: Array<Record<string, unkno
     return result as { content: Array<Record<string, unknown>> };
   }
 
+  // Prefer upstream structuredContent if already present (e.g., from a spec-compliant server).
+  const upstreamSC = extractUpstreamSC(result);
+
   const unwrapped = deepUnwrapResult(result);
-  const structuredContent = toStructuredContent(unwrapped);
+  const structuredContent = upstreamSC ?? toStructuredContent(unwrapped);
 
   if (isMcpContentWrapper(unwrapped)) {
     return {
