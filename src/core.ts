@@ -36,6 +36,12 @@ export const UPSTREAM_URL = process.env.MCP_URL ?? (() => {
 export const REQUEST_TIMEOUT_MS = 120_000;
 export const MAX_RETRIES = 2;
 
+// Response size annotation — raises Claude Code's persistence ceiling.
+// Without annotation: Claude Code caps MCP tool results at 50k chars (Vb_=50000).
+// With annotation: ceiling rises to min(this value, 500000 chars) (IU6=500000).
+// Set MCP_MAX_RESULT_CHARS=0 to disable annotation entirely.
+const MAX_RESULT_CHARS = parseInt(process.env.MCP_MAX_RESULT_CHARS || "500000", 10);
+
 // Auto-detect HTTPS proxy from environment
 const PROXY_URL = process.env.https_proxy || process.env.HTTPS_PROXY || "";
 const proxyDispatcher = PROXY_URL ? new ProxyAgent(PROXY_URL) : undefined;
@@ -264,40 +270,55 @@ export interface ToolSchema {
 }
 
 function transformToolSchema(tool: ToolSchema): ToolSchema {
-  if (!CALL_TOOL_NAMES.has(tool.name)) return tool;
-  if (!tool.inputSchema?.properties) return tool;
+  let result = tool;
 
-  const props = { ...tool.inputSchema.properties };
+  // --- args_json → args transform (call_tool_* only) ---
+  if (CALL_TOOL_NAMES.has(tool.name) && tool.inputSchema?.properties && "args_json" in tool.inputSchema.properties) {
+    const props = { ...tool.inputSchema.properties };
+    delete props.args_json;
+    props.args = {
+      type: "object",
+      description:
+        "The upstream tool's arguments as a native JSON object (not a string). " +
+        "IMPORTANT: Must be single-line compact JSON — do not pretty-print with newlines or indentation, " +
+        "as the parameter encoding layer may serialize multiline content as a string instead of an object. " +
+        "Use describe_tools to get the upstream tool's inputSchema, then pass " +
+        "those fields here directly. Example: if the upstream tool expects " +
+        '{owner: string, repo: string}, pass args: {"owner": "foo", "repo": "bar"}. ' +
+        "Nested strings containing JSON are fine — only the top-level args must be an object.",
+      additionalProperties: true,
+    };
 
-  if (!("args_json" in props)) return tool;
+    let required = tool.inputSchema.required;
+    if (required) {
+      required = required.map((r) => (r === "args_json" ? "args" : r));
+    }
 
-  delete props.args_json;
-  props.args = {
-    type: "object",
-    description:
-      "The upstream tool's arguments as a native JSON object (not a string). " +
-      "IMPORTANT: Must be single-line compact JSON — do not pretty-print with newlines or indentation, " +
-      "as the parameter encoding layer may serialize multiline content as a string instead of an object. " +
-      "Use describe_tools to get the upstream tool's inputSchema, then pass " +
-      "those fields here directly. Example: if the upstream tool expects " +
-      '{owner: string, repo: string}, pass args: {"owner": "foo", "repo": "bar"}. ' +
-      "Nested strings containing JSON are fine — only the top-level args must be an object.",
-    additionalProperties: true,
-  };
-
-  let required = tool.inputSchema.required;
-  if (required) {
-    required = required.map((r) => (r === "args_json" ? "args" : r));
+    result = {
+      ...tool,
+      inputSchema: {
+        ...tool.inputSchema,
+        properties: props,
+        ...(required ? { required } : {}),
+      },
+    };
   }
 
-  return {
-    ...tool,
-    inputSchema: {
-      ...tool.inputSchema,
-      properties: props,
-      ...(required ? { required } : {}),
-    },
-  };
+  // --- Response size annotation (all tools) ---
+  // Raises Claude Code's persistence ceiling from Vb_=50k to IU6=500k chars.
+  // Configurable via MCP_MAX_RESULT_CHARS env var. Set to 0 to disable.
+  if (MAX_RESULT_CHARS > 0) {
+    const existingMeta = (result._meta ?? {}) as Record<string, unknown>;
+    result = {
+      ...result,
+      _meta: {
+        ...existingMeta,
+        "anthropic/maxResultSizeChars": MAX_RESULT_CHARS,
+      },
+    };
+  }
+
+  return result;
 }
 
 /**
