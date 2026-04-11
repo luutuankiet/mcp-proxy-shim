@@ -93,6 +93,8 @@ Only 3 tools are transformed. **Everything else passes through unchanged:**
 | `upstream_servers` | — | Passthrough |
 | `code_execution` | — | Passthrough |
 | `read_cache` | — | Passthrough |
+| `describe_tools` | **Shim-local** | Batch-hydrate full schemas from BM25 |
+| `proxy_admin` | **Shim-local** | Proxy lifecycle management (see below) |
 | All others | — | Passthrough |
 
 ## Quick Start
@@ -377,6 +379,85 @@ We tested this live: added a YNAB financial tool mid-session → 43 new tools ap
 #   }
 # => [{ name: "Checking", balance: 1500000, ... }]
 ```
+
+## Proxy Administration (`proxy_admin`)
+
+The shim exposes a `proxy_admin` tool that gives agents direct access to the upstream proxy's admin API — no `curl`, no port guessing, no `run_command` needed.
+
+### Operations
+
+| Operation | Description | Example |
+|-----------|-------------|--------|
+| `list` | Show servers with health status | `proxy_admin({operation: "list"})` |
+| `restart` | Restart one upstream by name | `proxy_admin({operation: "restart", server_name: "thinkpad"})` |
+| `reconnect` | Reconnect all upstreams | `proxy_admin({operation: "reconnect"})` |
+| `tail_log` | Tail server logs for debugging | `proxy_admin({operation: "tail_log", server_name: "pi", lines: 20})` |
+
+### Recursive Fleet Tree
+
+With `recursive: true`, the shim walks nested shim-wrapped upstreams to build a full fleet view:
+
+```
+proxy_admin({operation: "list", recursive: true})
+
+→ Mac proxy (outermost)
+  ├─ thinkpad (60 tools) [shim-wrapped]
+  │   ├─ personal (9 tools)
+  │   ├─ joon (9 tools)
+  │   └─ kindle-gateway (13 tools)
+  ├─ pi (12 tools) [shim-wrapped]
+  │   └─ pi_at_slash (9 tools)
+  └─ util (230 tools) [shim-wrapped]
+      ├─ looker-da (62 tools)
+      ├─ github (41 tools)
+      └─ ...19 servers
+```
+
+### Nested Path Routing
+
+Restart servers on nested proxies using path notation:
+
+```
+proxy_admin({operation: "restart", server_name: "thinkpad/dell"})
+```
+
+This routes: outermost shim → `call_tool_read` → thinkpad's shim → thinkpad proxy admin API → dell restarted.
+
+### Shim-at-Every-Edge Architecture
+
+When every proxy-to-proxy boundary has a shim, `proxy_admin` becomes available at every level:
+
+```mermaid
+graph TD
+    A[MCP Client] --> B[Outermost Shim<br/>proxy_admin for Mac proxy]
+    B --> C[Mac Proxy :9999]
+    C --> D[Thinkpad Shim<br/>proxy_admin for TK proxy]
+    C --> E[Pi Shim<br/>proxy_admin for Pi proxy]
+    C --> F[Util Shim<br/>proxy_admin for GCE proxy]
+    D --> G[Thinkpad Proxy :8888]
+    E --> H[Pi Proxy :8888]
+    F --> I[GCE Proxy :9999]
+```
+
+**Client-side deployment:** shims run as stdio processes in the parent proxy's config — no changes needed on server hosts. Example:
+
+```json
+{
+  "name": "thinkpad",
+  "type": "stdio",
+  "command": "npx",
+  "args": ["-y", "@luutuankiet/mcp-proxy-shim"],
+  "env": {"MCP_URL": "https://thinkpad.example.com/mcp/all/?apikey=admin"}
+}
+```
+
+### How It Works
+
+The shim derives the admin API URL from `MCP_URL` automatically:
+- `http://localhost:9999/mcp/?apikey=admin` → admin API at `http://localhost:9999/api/v1/`
+- API key extracted from `?apikey=` query param (defaults to `admin`)
+
+Nested discovery uses `retrieve_tools` (BM25 with server attribution) to disambiguate multiple `proxy_admin` tools across shim-wrapped upstreams.
 
 ## Response Size Annotation
 

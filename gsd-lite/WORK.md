@@ -3,20 +3,20 @@
 ## 1. Current Understanding
 
 <current_mode>
-Issue #1 fixes shipped + daemon feature complete. Branch claude/fix-mcp-daemon-setup-B7wLA ready for merge to main. All changes tested against live wmcpproxy upstream.
+v1.4.1 shipped. proxy_admin tool live across all transport modes. Shim-at-every-edge deployed: Mac proxy wraps thinkpad/pi/util upstreams in stdio shims. Recursive fleet tree + nested path routing verified in production.
 </current_mode>
 
 <active_task>
-TASK-001: Merge branch to main (resolve branch situation with claude/fix-github-tool-mcp-proxy-AhISB)
 </active_task>
 
 <parked_tasks>
-- npm publish with updated version (post-merge)
+- Pi /mcp/all/ endpoint returns 0 tools — workaround: use /mcp/ instead. Root cause TBD.
+- CLAUDE.md blip recovery procedure (pointer to manage-mcp-proxy skill)
 - Dockerfile update for daemon mode
 </parked_tasks>
 
 <vision>
-MCP proxy shim as the standard client-side adapter for mcpproxy-go, plus a standalone daemon gateway for cloud agents that can't spawn MCP servers.
+MCP proxy shim as the universal agent-friendly interface layer for mcpproxy-go. Every proxy-to-proxy boundary gets a shim ("shim-at-every-edge"), making proxy_admin available at every level through standard MCP tooling. Agents self-heal blips without curl/run_command.
 </vision>
 
 <decisions>
@@ -25,14 +25,18 @@ DECISION-002: Re-serialize args via JSON.stringify(JSON.parse()) instead of pass
 DECISION-003: Reject invalid args with clear error instead of silent fallback to "{}" — never silently drop data.
 DECISION-004: Daemon mode is independent of core.ts — pure MCP SDK passthrough, no mcpproxy-go dependency.
 DECISION-005: daemon_help built-in tool + server instructions in initialize response — clients know how to use the gateway immediately.
+DECISION-006: proxy_admin derives admin URL from MCP_URL (same origin, /api/v1/ path). API key from ?apikey= param or defaults to "admin".
+DECISION-007: Shim-at-every-edge: push shim to CLIENT side (Mac proxy config), not server side. Zero changes needed on proxy hosts. Hot-reloadable via config.
+DECISION-008: Nested proxy_admin discovery uses retrieve_tools BM25 (server attribution) not tools/list (deduplicates). Route via call_tool_read (server:tool format).
+DECISION-009: Path notation ("thinkpad/personal") for nested restart — / separator is safe because mcpproxy-go server names are [a-zA-Z0-9_-].
 </decisions>
 
 <blockers>
-None active.
+Pi /mcp/all/ endpoint: returns 0 tools via shim but 9 tools via direct HTTP. Same mcpproxy-go v0.23.1 as thinkpad (which works fine). Workaround: use /mcp/ instead of /mcp/all/.
 </blockers>
 
 <next_action>
-Merge claude/fix-mcp-daemon-setup-B7wLA to main. Ditch middleman branch claude/fix-github-tool-mcp-proxy-AhISB.
+Debug Pi /mcp/all/ issue. Update CLAUDE.md blip recovery note + manage-mcp-proxy skill docs.
 </next_action>
 
 ---
@@ -47,6 +51,7 @@ Merge claude/fix-mcp-daemon-setup-B7wLA to main. Ditch middleman branch claude/f
 | 2026-03-25 | LOG-003: Daemon mode implemented | Multi-server MCP gateway: stdio + HTTP upstreams, pure passthrough, tool namespacing, custom headers |
 | 2026-03-26 | LOG-004: daemon_help tool + server instructions + README update | Clients get full usage guide via built-in tool and MCP instructions |
 | 2026-03-26 | LOG-005: Strict args validation — reject instead of silent fallback | ArgsValidationError with descriptive messages. Schema description updated. |
+| 2026-04-11 | LOG-006: proxy_admin tool — proxy lifecycle management + shim-at-every-edge | Agents self-heal blips via MCP tools. Recursive fleet tree. Nested path routing. v1.4.0→v1.4.1. |
 
 ---
 
@@ -120,6 +125,118 @@ Tested all scenarios:
 
 ---
 
-STATELESS HANDOFF
+📦 STATELESS HANDOFF
 **What was decided:** Never silently drop data. Reject with clear error that tells client how to fix.
 **Next action:** Write GSD-Lite artifacts, merge branch.
+
+### [LOG-006] - [DISCOVERY] [EXEC] - proxy_admin tool + shim-at-every-edge architecture - Task: TASK-003
+**Timestamp:** 2026-04-11 10:00
+**Depends On:** LOG-001 (core.ts foundation), LOG-002 (daemon mode)
+
+---
+
+#### Problem
+
+When upstream MCP servers blip (transient disconnect), agents waste 4-5 tool calls fumbling:
+1. Try tool → "not found"
+2. Try run_command → also not found
+3. Search servers → wrong params
+4. upstream_servers list → no restart operation
+5. Eventually tools come back on their own (~30s)
+
+The agent couldn't actively trigger a reconnect because:
+- `upstream_servers` meta tool has no `restart` operation (only list/add/remove/patch/tail_log)
+- Admin API requires curl + knowing the proxy port — different per session type
+- Three session types (CLI, Desktop, Cloud) each connect to different proxies
+
+#### Architecture: Shim-at-Every-Edge
+
+Key insight: the shim (`@luutuankiet/mcp-proxy-shim`) is the universal constant across all session types. Every session flows through it. So we add admin capabilities TO the shim.
+
+```mermaid
+graph TD
+    A[Claude Code] --> B[Outermost Shim]
+    B --> C[Mac Proxy :9999]
+    C --> D[Thinkpad Shim stdio]
+    C --> E[Pi Shim stdio]
+    C --> F[Util Shim stdio]
+    D --> G[Thinkpad Proxy :8888]
+    E --> H[Pi Proxy :8888]
+    F --> I[GCE Proxy :9999]
+    G --> J[personal, joon, dell, nas, kindle-gateway]
+    H --> K[pi_at_slash]
+    I --> L[looker, github, ynab, n8n, ...19 servers]
+    
+    style B fill:#f96,stroke:#333
+    style D fill:#f96,stroke:#333
+    style E fill:#f96,stroke:#333
+    style F fill:#f96,stroke:#333
+```
+
+Client-side deployment: shims run as stdio processes on the Mac, not on server hosts. Zero changes to existing systemd services. Hot-reloadable via proxy config.
+
+#### Implementation (P0-P3)
+
+**P0 — Core (core.ts, daemon.ts):**
+- `getAdminBaseUrl()`: derives admin API URL from MCP_URL. `http://localhost:9999/mcp/?apikey=admin` → `http://localhost:9999/api/v1/`
+- `adminRequest(method, path)`: HTTP calls to admin API with X-API-Key header
+- `PROXY_ADMIN_SCHEMA`: shim-local tool with operations: list, restart, reconnect, tail_log
+- `handleProxyAdminOperation()`: shared handler for MCP tool + daemon REST
+- Daemon's `/call` catches `name === "proxy_admin"` before upstream forwarding
+
+**P2 — Path routing:**
+- `server_name: "thinkpad/personal"` splits on `/`, discovers thinkpad's proxy_admin via retrieve_tools, routes through `call_tool_read`
+
+**P3 — Recursive list:**
+- `recursive: true` walks all shim-wrapped upstreams, calls their proxy_admin, merges into tree
+
+#### Discovery Bug (v1.4.0 → v1.4.1)
+
+Original `discoverNestedProxyAdmin` scanned `cachedTools` (from `tools/list`) for tools ending with `__proxy_admin`. But shim-wrapped upstreams expose `proxy_admin` (no prefix). When 3 upstreams all have `proxy_admin`, `tools/list` deduplicates — losing server attribution.
+
+**Fix:** Use `retrieve_tools` (BM25) which returns `server` field. Match `tool.name === "proxy_admin" && tool.server === serverName`. Route via `call_tool_read` with `server:proxy_admin` format for disambiguation.
+
+#### Evidence
+
+**Recursive list output (production, v1.4.1):**
+```
+Mac proxy (outermost)
+├─ pi (12 tools) [shim-wrapped]
+│   └─ pi_at_slash (9 tools)
+├─ thinkpad (60 tools) [shim-wrapped]
+│   ├─ personal (9), joon (9), dell (9), nas (9), thinkpad_host (9)
+│   └─ kindle-gateway (13 tools)
+├─ util (230 tools) [shim-wrapped]
+│   ├─ looker-da (62), ynab (44), github (41), n8n (24), freshrss (18)
+│   └─ ...19 servers total
+└─ mac (disabled)
+```
+
+**Path routing test:**
+```
+proxy_admin({operation: "restart", server_name: "thinkpad/dell"})  
+→ {success: true, data: {server: "dell", action: "restart", success: true}}
+```
+
+Chain: Mac shim → Mac proxy → call_tool_read → thinkpad shim → thinkpad:8888 admin API → dell restarted.
+
+#### Known Issue: Pi /mcp/all/
+
+Pi proxy v0.23.1 returns 0 tools via `/mcp/all/` but works via `/mcp/`. Same mcpproxy version as thinkpad (works fine). Workaround: Pi shim uses `/mcp/` instead of `/mcp/all/`. Root cause TBD.
+
+#### Files Changed
+
+| File | Lines | Summary |
+|------|-------|--------|
+| src/core.ts | +263 (v1.4.0), +50/-22 (v1.4.1) | Admin helpers, proxy_admin schema/handler, discovery fix |
+| src/daemon.ts | +16 | Import handleProxyAdminOperation, catch in /call handler |
+| test/daemon-e2e.mjs | +109 | Mock admin API + 6 proxy_admin test cases (31/31 pass) |
+| package.json | version bump | 1.3.5 → 1.4.0 → 1.4.1 |
+
+---
+
+📦 STATELESS HANDOFF
+**Dependency chain:** LOG-006 ← LOG-001 (core.ts), LOG-002 (daemon)
+**What was decided:** proxy_admin tool exposes admin API through standard MCP tooling. Shim-at-every-edge: client-side stdio shims wrap each proxy upstream. BM25 discovery + call_tool_read routing for nested chains.
+**Next action:** Debug Pi /mcp/all/ issue. Update CLAUDE.md blip note + manage-mcp-proxy skill docs.
+**If pivoting:** Start from LOG-006 + fleet tree output above for full architecture context.
