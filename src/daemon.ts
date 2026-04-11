@@ -96,6 +96,37 @@ const startTime = Date.now();
 let callCount = 0;
 
 // ---------------------------------------------------------------------------
+// Overflow handling — bypass Claude Code's hardcoded 30K Bash stdout em4 stash.
+// Claude Code's Bash tool has maxResultSizeChars hardcoded at 30000
+// (cli.js:1827, sm4 → min(30000, 50000)) with NO env var bypass. When the
+// JSON-stringified response exceeds OVERFLOW_THRESHOLD chars, we write the
+// full body to a file in OVERFLOW_DIR and return a small envelope with the
+// path. The agent then uses the local Read tool (em4 threshold 100K) to
+// consume the full payload — single Read for ≤100K, Read with offset/limit
+// for larger. This is the realistic best for the daemon REST path since
+// Bash stdout cannot be lifted past 30K.
+// ---------------------------------------------------------------------------
+
+const OVERFLOW_THRESHOLD = parseInt(
+  process.env.MCP_REST_OVERFLOW_THRESHOLD || "25000",
+  10,
+);
+const OVERFLOW_DIR = process.env.MCP_REST_OVERFLOW_DIR ||
+  join(process.env.TMPDIR || "/tmp", "mcp-results");
+const OVERFLOW_PREVIEW_CHARS = 1500;
+
+let overflowDirReady = false;
+function ensureOverflowDir(): void {
+  if (overflowDirReady) return;
+  try {
+    mkdirSync(OVERFLOW_DIR, { recursive: true });
+    overflowDirReady = true;
+  } catch (err) {
+    log("Warning: could not create overflow dir:", (err as Error).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // JSON body parser
 // ---------------------------------------------------------------------------
 
@@ -128,7 +159,61 @@ function jsonResponse(
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
   });
-  res.end(JSON.stringify(body));
+
+  const serialized = JSON.stringify(body);
+
+  // Pass through small responses + non-200 errors unchanged.
+  if (serialized.length <= OVERFLOW_THRESHOLD || status !== 200) {
+    res.end(serialized);
+    return;
+  }
+
+  // Overflow path: stash full body to file, return small envelope.
+  // CRITICAL: file content must be Read-tool-paginatable (line-based offset/limit).
+  // - If body is a STRING (e.g. grep output), write raw bytes — preserves \n chars.
+  // - If body is an OBJECT/ARRAY, write pretty-printed JSON — one key per line.
+  // - Otherwise, fall back to JSON.stringify (rare path, e.g. primitives).
+  ensureOverflowDir();
+  const id = randomUUID().slice(0, 8);
+  const isStringBody = typeof body === "string";
+  const isObjectBody = !isStringBody && body !== null && typeof body === "object";
+  const ext = isStringBody ? ".txt" : ".json";
+  const filepath = join(OVERFLOW_DIR, `r_${id}${ext}`);
+
+  let fileContent: string;
+  if (isStringBody) {
+    fileContent = body as string;
+  } else if (isObjectBody) {
+    fileContent = JSON.stringify(body, null, 2);
+  } else {
+    fileContent = serialized;
+  }
+
+  try {
+    writeFileSync(filepath, fileContent);
+  } catch (err) {
+    // Fall back to inline if file write fails — agent will see Claude's stash msg.
+    log("Overflow file write failed, falling back to inline:", (err as Error).message);
+    res.end(serialized);
+    return;
+  }
+
+  const format = isStringBody ? "raw_text" : (isObjectBody ? "pretty_json" : "json");
+  const envelope = {
+    _shim_overflow: true,
+    size: serialized.length,
+    file_size: fileContent.length,
+    file: filepath,
+    format,
+    hint:
+      `Response is ${serialized.length} chars (> ${OVERFLOW_THRESHOLD} threshold). ` +
+      `Full body written to 'file' as ${format} (${fileContent.length} chars). ` +
+      `Use the Read tool on the file path (NOT Bash cat) — Read bypasses ` +
+      `Claude Code's hardcoded 30K Bash stdout em4 stash. ` +
+      `Read paginates by lines via offset/limit; this file is line-friendly.`,
+    preview: (isStringBody ? (body as string) : fileContent).slice(0, OVERFLOW_PREVIEW_CHARS),
+  };
+  res.end(JSON.stringify(envelope));
 }
 
 /**
