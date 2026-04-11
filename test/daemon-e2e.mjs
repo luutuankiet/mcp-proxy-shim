@@ -31,6 +31,46 @@ let passed = 0;
 let failed = 0;
 const mockSessionId = "mock-session-" + Date.now();
 
+// Mock admin API server list
+const MOCK_ADMIN_SERVERS = [
+  { name: "server-a", health: { summary: "Connected (10 tools)" }, enabled: true, url: "http://localhost:1111/mcp/all/", protocol: "http" },
+  { name: "server-b", health: { summary: "Connecting..." }, enabled: true, url: "http://localhost:2222/mcp/all/", protocol: "http" },
+  { name: "server-c", health: { summary: "Disabled", admin_state: "disabled" }, enabled: false, url: "", protocol: "stdio" },
+];
+
+function handleMockAdminApi(req, res, pathname) {
+  res.setHeader("Content-Type", "application/json");
+
+  if (pathname === "/api/v1/servers" && req.method === "GET") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { servers: MOCK_ADMIN_SERVERS, stats: { total_servers: 3 } } }));
+    return;
+  }
+
+  const restartMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/restart$/);
+  if (restartMatch && req.method === "POST") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { action: "restart", server: restartMatch[1], success: true } }));
+    return;
+  }
+
+  if (pathname === "/api/v1/servers/reconnect" && req.method === "POST") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { action: "reconnect", success: true } }));
+    return;
+  }
+
+  const logsMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/logs$/);
+  if (logsMatch && req.method === "GET") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { server: logsMatch[1], lines: ["mock log line 1", "mock log line 2"] } }));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: "Not found" }));
+}
+
 // ---------------------------------------------------------------------------
 // Mock MCP Upstream
 // ---------------------------------------------------------------------------
@@ -167,6 +207,13 @@ function handleMockRpc(body) {
 function startMockServer() {
   return new Promise((resolve, reject) => {
     mockServer = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+      // Admin API mock (for proxy_admin tests)
+      if (reqUrl.pathname.startsWith("/api/v1/")) {
+        return handleMockAdminApi(req, res, reqUrl.pathname);
+      }
+
       res.setHeader("Mcp-Session-Id", mockSessionId);
 
       if (req.method === "OPTIONS") {
@@ -406,7 +453,67 @@ async function runTests() {
     assert("still ok", r.body.ok === true, `got: ${JSON.stringify(r.body.ok)}`);
   }
 
-  // Test 10: Unknown endpoint
+  // proxy_admin tests
+  console.log("\nTest: proxy_admin list");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "list" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    assert("has servers array", Array.isArray(r.body?.servers), `body: ${JSON.stringify(r.body).slice(0, 300)}`);
+    assert("server count is 3", r.body?.total === 3, `got total: ${r.body?.total}`);
+    const names = (r.body?.servers || []).map(s => s.name);
+    assert("has server-a", names.includes("server-a"), `names: ${names}`);
+  }
+
+  console.log("\nTest: proxy_admin restart");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "restart", server_name: "server-a" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin restart (missing server_name)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "restart" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+    assert("has error msg", !!r.body?.error, `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin reconnect");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "reconnect" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin tail_log");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "tail_log", server_name: "server-a", lines: 10 },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin unknown operation");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "bogus" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+  }
+
+  // Unknown endpoint test
   console.log("\nTest: GET /unknown");
   {
     const r = await request("GET", "/nonexistent");

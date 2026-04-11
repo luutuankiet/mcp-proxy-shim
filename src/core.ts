@@ -77,6 +77,41 @@ const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
   },
 };
 
+const PROXY_ADMIN_SCHEMA: ToolSchema = {
+  name: "proxy_admin",
+  description:
+    "Manage the upstream MCP proxy — list connected servers, restart specific upstreams, " +
+    "reconnect all, or tail server logs. Use for blip recovery when upstream tools drop. " +
+    "Supports nested proxy chains via path notation (e.g., server_name: \"thinkpad/personal\").",
+  inputSchema: {
+    type: "object",
+    properties: {
+      operation: {
+        type: "string",
+        enum: ["list", "restart", "reconnect", "tail_log"],
+        description:
+          "list: show servers with health status. restart: restart one server by name. " +
+          "reconnect: reconnect all servers. tail_log: show recent logs for a server.",
+      },
+      server_name: {
+        type: "string",
+        description:
+          "Server name (required for restart/tail_log). " +
+          "Path notation for nested proxies: \"thinkpad/personal\" routes through thinkpad's proxy_admin.",
+      },
+      lines: {
+        type: "number",
+        description: "Lines to return for tail_log (default: 50, max: 500).",
+      },
+      recursive: {
+        type: "boolean",
+        description: "For list: include servers from nested shim-wrapped upstreams.",
+      },
+    },
+    required: ["operation"],
+  },
+};
+
 // ---------------------------------------------------------------------------
 // Upstream MCP session (manual HTTP — avoids SDK client bugs)
 // ---------------------------------------------------------------------------
@@ -102,6 +137,69 @@ export function log(...args: unknown[]) {
 /** Mask credentials in log output */
 export function maskUrl(url: string) {
   return url.replace(/apikey=[^&\s]+/gi, "apikey=***").replace(/\/\/[^@]*@/, "//***@");
+}
+
+// ---------------------------------------------------------------------------
+// Admin API helpers — proxy lifecycle management
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the admin API base URL from the upstream MCP_URL.
+ * "http://localhost:9999/mcp/?apikey=admin" → "http://localhost:9999/api/v1/"
+ */
+export function getAdminBaseUrl(): string {
+  const url = new URL(UPSTREAM_URL);
+  return `${url.origin}/api/v1/`;
+}
+
+/**
+ * Extract API key from MCP_URL for admin API authentication.
+ * Falls back to "admin" — the standard mcpproxy-go default.
+ */
+function getAdminApiKey(): string {
+  try {
+    const url = new URL(UPSTREAM_URL);
+    return url.searchParams.get("apikey") || "admin";
+  } catch {
+    return "admin";
+  }
+}
+
+/**
+ * Make an HTTP request to the upstream proxy's admin API.
+ * Derives the admin URL from MCP_URL and forwards the API key.
+ */
+export async function adminRequest(
+  method: string,
+  path: string,
+): Promise<{ status: number; data: unknown }> {
+  const baseUrl = getAdminBaseUrl();
+  const fullUrl = `${baseUrl}${path}`;
+  const apiKey = getAdminApiKey();
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-API-Key": apiKey,
+  };
+
+  const fetchOpts: RequestInit & { dispatcher?: object } = {
+    method,
+    headers,
+    signal: AbortSignal.timeout(10_000),
+  };
+  if (proxyDispatcher) {
+    fetchOpts.dispatcher = proxyDispatcher;
+  }
+
+  const resp = await fetch(fullUrl, fetchOpts as RequestInit);
+  let data: unknown;
+  try {
+    data = await resp.json();
+  } catch {
+    data = await resp.text();
+  }
+
+  return { status: resp.status, data };
 }
 
 interface JsonRpcResponse {
@@ -671,6 +769,147 @@ function resolveToolFromIndex(name: string, index: Map<string, ToolSchema>): Too
   return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Admin operations — proxy_admin tool implementation
+// ---------------------------------------------------------------------------
+
+/**
+ * Discover a nested proxy_admin tool for a specific upstream server.
+ * Scans cached tool list for tools ending with "__proxy_admin" whose name
+ * contains the target server name.
+ */
+async function discoverNestedProxyAdmin(serverName: string): Promise<string | null> {
+  if (!cachedTools) {
+    try {
+      cachedTools = await fetchUpstreamTools();
+    } catch {
+      return null;
+    }
+  }
+
+  const candidates: string[] = [];
+  for (const tool of cachedTools) {
+    if (tool.name === "proxy_admin") continue;
+    if (tool.name.endsWith("__proxy_admin") || tool.name === `${serverName}__proxy_admin`) {
+      candidates.push(tool.name);
+    }
+  }
+
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  for (const name of candidates) {
+    if (name.toLowerCase().includes(serverName.toLowerCase())) {
+      return name;
+    }
+  }
+
+  return candidates[0];
+}
+
+/**
+ * Handle a proxy_admin operation. Shared between MCP tool handler and daemon REST.
+ */
+export async function handleProxyAdminOperation(
+  operation: string,
+  serverName: string,
+  options: { lines?: number; recursive?: boolean } = {},
+): Promise<{ data: unknown; isError?: boolean }> {
+  const { lines = 50, recursive = false } = options;
+
+  // P2: Path routing for nested proxy chains
+  if (serverName.includes("/") && (operation === "restart" || operation === "tail_log")) {
+    const segments = serverName.split("/");
+    const targetServer = segments[0];
+    const remainingPath = segments.slice(1).join("/");
+
+    const nestedTool = await discoverNestedProxyAdmin(targetServer);
+    if (!nestedTool) {
+      return {
+        data: { error: `No proxy_admin tool found for server "${targetServer}". Is it shim-wrapped?` },
+        isError: true,
+      };
+    }
+
+    await ensureSession();
+    const resp = await mcpRequest("tools/call", {
+      name: nestedTool,
+      arguments: { operation, server_name: remainingPath, lines },
+    });
+
+    if (!resp || resp.error) {
+      return {
+        data: { error: "Nested proxy_admin call failed", detail: resp?.error || "no response" },
+        isError: true,
+      };
+    }
+
+    return { data: deepUnwrapResult(resp.result) };
+  }
+
+  if (operation === "list") {
+    const result = await adminRequest("GET", "servers");
+    const output = result.data as Record<string, unknown>;
+    const serversRaw = ((output?.data as Record<string, unknown>)?.servers as unknown[]) || [];
+
+    const servers = (serversRaw as Record<string, unknown>[]).map((s) => ({
+      name: s.name,
+      health: (s.health as Record<string, unknown>)?.summary ?? s.health,
+      enabled: s.enabled,
+      url: s.url || "(stdio)",
+      protocol: s.protocol,
+    }));
+
+    // P3: Recursive — walk nested shim-wrapped upstreams
+    if (recursive) {
+      for (const server of servers) {
+        const nestedTool = await discoverNestedProxyAdmin(server.name as string);
+        if (nestedTool) {
+          try {
+            await ensureSession();
+            const resp = await mcpRequest("tools/call", {
+              name: nestedTool,
+              arguments: { operation: "list" },
+            });
+            if (resp?.result) {
+              (server as Record<string, unknown>).nested_servers =
+                deepUnwrapResult(resp.result);
+              (server as Record<string, unknown>).shim_wrapped = true;
+            }
+          } catch (err) {
+            (server as Record<string, unknown>).nested_error = (err as Error).message;
+          }
+        }
+      }
+    }
+
+    return { data: { servers, total: servers.length } };
+  }
+
+  if (operation === "restart") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for restart" }, isError: true };
+    }
+    const result = await adminRequest("POST", `servers/${encodeURIComponent(serverName)}/restart`);
+    return { data: result.data };
+  }
+
+  if (operation === "reconnect") {
+    const result = await adminRequest("POST", "servers/reconnect");
+    return { data: result.data };
+  }
+
+  if (operation === "tail_log") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for tail_log" }, isError: true };
+    }
+    const result = await adminRequest("GET", `servers/${encodeURIComponent(serverName)}/logs?lines=${lines}`);
+    return { data: result.data };
+  }
+
+  return { data: { error: `Unknown operation: ${operation}` }, isError: true };
+}
+
 
 // ---------------------------------------------------------------------------
 // Server factory — creates a wired-up MCP Server (transport-agnostic)
@@ -732,6 +971,7 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       tools: [
         ...cachedTools.map(transformToolSchema),
         DESCRIBE_TOOLS_SCHEMA,
+        PROXY_ADMIN_SCHEMA,
       ],
     };
   });
@@ -820,6 +1060,29 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
         content: [{ type: "text" as const, text: JSON.stringify(results) }],
         structuredContent: toStructuredContent(results),
       };
+    }
+
+    // --- Shim-local: proxy_admin ---
+    if (name === "proxy_admin") {
+      const operation = (args?.operation ?? "") as string;
+      const serverName = (args?.server_name ?? "") as string;
+      const lines = (args?.lines ?? 50) as number;
+      const recursive = (args?.recursive ?? false) as boolean;
+
+      try {
+        const result = await handleProxyAdminOperation(operation, serverName, { lines, recursive });
+        const text = typeof result.data === "string" ? result.data : JSON.stringify(result.data);
+        return {
+          content: [{ type: "text" as const, text }],
+          ...(result.isError ? { isError: true } : {}),
+          structuredContent: toStructuredContent(result.data),
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+          isError: true,
+        };
+      }
     }
 
     let forwardArgs: Record<string, unknown>;

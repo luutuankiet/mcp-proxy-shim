@@ -51,6 +51,7 @@ import {
   reinitOnExpiry,
   getSessionId,
   resetSessionId,
+  handleProxyAdminOperation,
 } from "./core.js";
 
 // ---------------------------------------------------------------------------
@@ -379,6 +380,21 @@ async function handleCall(
     return jsonResponse(res, 400, {
       error: `Invalid method: ${method}. Must be one of: ${validMethods.join(", ")}`,
     });
+  }
+
+  // Shim-local: proxy_admin (not forwarded upstream)
+  if (name === "proxy_admin") {
+    try {
+      callCount++;
+      const result = await handleProxyAdminOperation(
+        (args.operation ?? "") as string,
+        (args.server_name ?? "") as string,
+        { lines: (args.lines ?? 50) as number, recursive: (args.recursive ?? false) as boolean },
+      );
+      return jsonResponse(res, result.isError ? 400 : 200, result.data);
+    } catch (err) {
+      return jsonResponse(res, 500, { error: (err as Error).message });
+    }
   }
 
   try {
