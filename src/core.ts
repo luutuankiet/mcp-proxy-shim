@@ -57,7 +57,7 @@ const CALL_TOOL_NAMES = new Set([
 // Shim-local tools (not forwarded upstream)
 // ---------------------------------------------------------------------------
 
-const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
+export const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
   name: "describe_tools",
   description:
     "Get full schemas for specific tools by name. Use after retrieve_tools to hydrate " +
@@ -77,7 +77,7 @@ const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
   },
 };
 
-const PROXY_ADMIN_SCHEMA: ToolSchema = {
+export const PROXY_ADMIN_SCHEMA: ToolSchema = {
   name: "proxy_admin",
   description:
     "Manage the upstream MCP proxy — list connected servers, restart specific upstreams, " +

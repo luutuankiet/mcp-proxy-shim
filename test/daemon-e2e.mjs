@@ -513,6 +513,65 @@ async function runTests() {
     assert("status 400", r.status === 400, `got: ${r.status}`);
   }
 
+  // Shim-local tool discovery tests (LOG-007 BUG 2 fix)
+  console.log("\nTest: POST /retrieve_tools (shim-local proxy_admin discovery)");
+  {
+    const r = await request("POST", "/retrieve_tools", { query: "proxy_admin" });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const tools = r.body?.tools || (Array.isArray(r.body) ? r.body : null);
+    assert(
+      "returns tools array",
+      Array.isArray(tools),
+      `body: ${JSON.stringify(r.body).slice(0, 200)}`,
+    );
+    const names = (tools || []).map((t) => t.name);
+    assert(
+      "contains proxy_admin",
+      names.includes("proxy_admin"),
+      `names: ${JSON.stringify(names)}`,
+    );
+    assert(
+      "contains describe_tools",
+      names.includes("describe_tools"),
+      `names: ${JSON.stringify(names)}`,
+    );
+    const proxyAdmin = (tools || []).find((t) => t.name === "proxy_admin");
+    assert(
+      "proxy_admin has server=shim-local",
+      proxyAdmin?.server === "shim-local",
+      `got: ${proxyAdmin?.server}`,
+    );
+    assert(
+      "proxy_admin has call_with=call_tool_destructive",
+      proxyAdmin?.call_with === "call_tool_destructive",
+      `got: ${proxyAdmin?.call_with}`,
+    );
+  }
+
+  console.log("\nTest: POST /describe_tools (shim-local resolution)");
+  {
+    const r = await request("POST", "/describe_tools", {
+      names: ["proxy_admin", "describe_tools"],
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const results = Array.isArray(r.body) ? r.body : [r.body];
+    assert("returns 2 results", results.length === 2, `got: ${results.length}`);
+    const pa = results.find((t) => t?.name === "proxy_admin");
+    const dt = results.find((t) => t?.name === "describe_tools");
+    assert("proxy_admin resolved", !!pa && !pa.error, `got: ${JSON.stringify(pa).slice(0, 200)}`);
+    assert("describe_tools resolved", !!dt && !dt.error, `got: ${JSON.stringify(dt).slice(0, 200)}`);
+    assert(
+      "proxy_admin has inputSchema with operation",
+      !!pa?.inputSchema?.properties?.operation,
+      `schema: ${JSON.stringify(pa?.inputSchema).slice(0, 200)}`,
+    );
+    assert(
+      "describe_tools has inputSchema with names",
+      !!dt?.inputSchema?.properties?.names,
+      `schema: ${JSON.stringify(dt?.inputSchema).slice(0, 200)}`,
+    );
+  }
+
   // Unknown endpoint test
   console.log("\nTest: GET /unknown");
   {

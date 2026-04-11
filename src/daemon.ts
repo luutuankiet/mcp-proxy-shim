@@ -52,7 +52,33 @@ import {
   getSessionId,
   resetSessionId,
   handleProxyAdminOperation,
+  PROXY_ADMIN_SCHEMA,
+  DESCRIBE_TOOLS_SCHEMA,
 } from "./core.js";
+
+// ---------------------------------------------------------------------------
+// Shim-local tool discovery entries
+//
+// These tools are registered ONLY at the shim layer (not in upstream mcpproxy-go's
+// BM25 index). Daemon REST /retrieve_tools and /describe_tools used to miss them
+// entirely because those handlers only query upstream. We now inject both tools
+// directly into discovery results — mirroring the unconditional registration that
+// `createShimServer` already does for the native MCP /mcp endpoint (see core.ts
+// ListToolsRequestSchema handler). Fixes LOG-007 BUG 2.
+// ---------------------------------------------------------------------------
+
+const SHIM_LOCAL_DISCOVERY_ENTRIES = [
+  {
+    ...PROXY_ADMIN_SCHEMA,
+    server: "shim-local",
+    call_with: "call_tool_destructive" as const,
+  },
+  {
+    ...DESCRIBE_TOOLS_SCHEMA,
+    server: "shim-local",
+    call_with: "call_tool_read" as const,
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Auto-load .cloud.env from CWD if MCP_URL not in environment
@@ -323,7 +349,31 @@ async function handleRetrieveTools(
     }
 
     const compacted = compactRetrieveTools(deepUnwrapResult(resp.result), body);
-    const unwrapped = unwrapForRest(compacted);
+    const unwrapped = unwrapForRest(compacted) as Record<string, unknown>;
+
+    // Inject shim-local tools (proxy_admin, describe_tools) into discovery.
+    // Always prepended — mirrors core.ts tools/list semantics (unconditional).
+    // LOG-007 BUG 2 fix.
+    if (unwrapped && typeof unwrapped === "object") {
+      const existingTools = Array.isArray((unwrapped as { tools?: unknown[] }).tools)
+        ? ((unwrapped as { tools: unknown[] }).tools)
+        : null;
+      if (existingTools) {
+        const existingNames = new Set(
+          existingTools
+            .map((t) => (t as { name?: string }).name)
+            .filter((n): n is string => typeof n === "string"),
+        );
+        const injected = SHIM_LOCAL_DISCOVERY_ENTRIES.filter(
+          (t) => !existingNames.has(t.name),
+        );
+        (unwrapped as { tools: unknown[] }).tools = [...injected, ...existingTools];
+        if (typeof (unwrapped as { total?: number }).total === "number") {
+          (unwrapped as { total: number }).total += injected.length;
+        }
+      }
+    }
+
     return jsonResponse(res, 200, unwrapped);
   } catch (err) {
     return jsonResponse(res, 500, { error: (err as Error).message });
@@ -375,6 +425,14 @@ async function handleDescribeTools(
 
     // 2. Query upstream retrieve_tools for each (full schemas, no compaction)
     const index = new Map<string, Record<string, unknown>>();
+
+    // Seed with shim-local tools so describe_tools resolves them without
+    // ever hitting upstream (upstream mcpproxy-go doesn't know they exist).
+    // LOG-007 BUG 2 fix.
+    for (const shimTool of SHIM_LOCAL_DISCOVERY_ENTRIES) {
+      index.set(shimTool.name, shimTool as unknown as Record<string, unknown>);
+      index.set(`shim-local:${shimTool.name}`, shimTool as unknown as Record<string, unknown>);
+    }
     for (const query of queries) {
       try {
         const resp = await mcpRequest("tools/call", {

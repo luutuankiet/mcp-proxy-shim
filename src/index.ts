@@ -69,6 +69,10 @@ if (subcommand === "--help" || subcommand === "-h") {
   console.log("  POST /reinit          Force new upstream session");
   console.log("  POST /mcp             Streamable HTTP (backward compat)");
   console.log("");
+  console.log("Daemon built-in tools (shim-local, surfaced in discovery):");
+  console.log("  proxy_admin      Manage upstream MCP proxy (list/restart/reconnect/tail_log)");
+  console.log("  describe_tools   Batch-hydrate tool schemas by name");
+  console.log("");
   console.log("Passthru mode (generic MCP→REST bridge):");
   console.log("  passthru -- <command> [args]   Spawn a stdio MCP server");
   console.log("  passthru --url <URL>           Connect to HTTP Streamable server");
