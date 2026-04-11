@@ -378,6 +378,51 @@ We tested this live: added a YNAB financial tool mid-session → 43 new tools ap
 # => [{ name: "Checking", balance: 1500000, ... }]
 ```
 
+## Response Size Annotation
+
+Claude Code has a hardcoded 50,000 char ceiling (`Vb_=50000` in the binary) for MCP tool results. Responses exceeding this are persisted to disk and replaced with a 2KB preview — forcing the agent to waste 3-5 extra calls recovering the content.
+
+The shim solves this by annotating **every proxied tool** with `_meta["anthropic/maxResultSizeChars"]` in the `tools/list` response. When Claude Code sees this annotation, it raises the ceiling from 50k to up to 500k chars (`IU6=500000`), letting large responses flow through inline.
+
+### How it works
+
+```mermaid
+sequenceDiagram
+    participant CC as Claude Code
+    participant Shim as mcp-proxy-shim
+    participant Proxy as mcpproxy-go
+
+    CC->>Shim: tools/list
+    Shim->>Proxy: tools/list
+    Proxy-->>Shim: tools (no annotation)
+    Note over Shim: Inject _meta annotation<br/>on every tool
+    Shim-->>CC: tools with _meta:<br/>{"anthropic/maxResultSizeChars": 500000}
+
+    Note over CC: Persistence ceiling<br/>raised from 50k → 500k chars
+
+    CC->>Shim: call_tool_read (multi-file read)
+    Shim->>Proxy: call_tool_read
+    Proxy-->>Shim: 60k chars response
+    Shim-->>CC: 60k chars (inline ✅)
+    Note over CC: Without annotation:<br/>persisted to disk ❌
+```
+
+### Before vs After
+
+| Scenario | Without annotation (v1.3.3) | With annotation (v1.3.4+) |
+|----------|---------------------------|---------------------------|
+| 4-file read (~53k chars) | Persisted to disk → 2KB preview → 5 wasted recovery calls | Inline, 1 call ✅ |
+| Large command output (~80k chars) | Same persistence trap | Inline up to 500k chars ✅ |
+| Responses under 50k chars | No change | No change |
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_MAX_RESULT_CHARS` | `500000` | Value for the `anthropic/maxResultSizeChars` annotation. Claude Code's max is 500,000 chars. Set to `0` to disable the annotation entirely. |
+
+In a **shim chain** (e.g., Claude Code → shim → proxy → inner shim → proxy), only the outermost shim's annotation matters — Claude Code only sees tools listed by the shim it directly connects to. Inner shim annotations are harmless but overwritten.
+
 ## Configuration
 
 | Environment variable | Default | Transport | Description |
@@ -386,6 +431,7 @@ We tested this live: added a YNAB financial tool mid-session → 43 new tools ap
 | `MCP_PORT` | `3000` | HTTP only | Port to listen on |
 | `MCP_HOST` | `0.0.0.0` | HTTP only | Host to bind to |
 | `MCP_APIKEY` | — (open) | HTTP only | API key for downstream clients. When set, requests must include `?apikey=KEY`. Unset = no auth. |
+| `MCP_MAX_RESULT_CHARS` | `500000` | All | `anthropic/maxResultSizeChars` annotation value. Raises Claude Code's response persistence ceiling. Set `0` to disable. |
 | `https_proxy` / `HTTPS_PROXY` | — | Both | HTTPS proxy (auto-detected via undici ProxyAgent) |
 
 ## Architecture Details
