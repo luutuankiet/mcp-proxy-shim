@@ -775,10 +775,36 @@ function resolveToolFromIndex(name: string, index: Map<string, ToolSchema>): Too
 
 /**
  * Discover a nested proxy_admin tool for a specific upstream server.
- * Scans cached tool list for tools ending with "__proxy_admin" whose name
- * contains the target server name.
+ * Uses retrieve_tools (BM25) which returns server attribution, handling
+ * multiple upstreams that expose identically-named "proxy_admin" tools.
+ * Returns "server:proxy_admin" format for use with call_tool_read routing.
  */
 async function discoverNestedProxyAdmin(serverName: string): Promise<string | null> {
+  // Primary: BM25 search with server attribution
+  try {
+    await ensureSession();
+    const resp = await mcpRequest("tools/call", {
+      name: "retrieve_tools",
+      arguments: { query: `${serverName} proxy_admin`, limit: 10 },
+    });
+    if (resp?.result) {
+      const unwrapped = deepUnwrapResult(resp.result) as Record<string, unknown>;
+      const tools: unknown[] = Array.isArray(unwrapped)
+        ? unwrapped
+        : (Array.isArray(unwrapped?.tools) ? unwrapped.tools as unknown[] : []);
+
+      for (const t of tools) {
+        const tool = t as Record<string, unknown>;
+        if (tool.name === "proxy_admin" && tool.server === serverName) {
+          return `${serverName}:proxy_admin`;
+        }
+      }
+    }
+  } catch (err) {
+    log("discoverNestedProxyAdmin retrieve_tools failed:", (err as Error).message);
+  }
+
+  // Fallback: scan cachedTools for prefixed __proxy_admin naming
   if (!cachedTools) {
     try {
       cachedTools = await fetchUpstreamTools();
@@ -787,24 +813,14 @@ async function discoverNestedProxyAdmin(serverName: string): Promise<string | nu
     }
   }
 
-  const candidates: string[] = [];
   for (const tool of cachedTools) {
     if (tool.name === "proxy_admin") continue;
-    if (tool.name.endsWith("__proxy_admin") || tool.name === `${serverName}__proxy_admin`) {
-      candidates.push(tool.name);
+    if (tool.name.endsWith("__proxy_admin") && tool.name.toLowerCase().includes(serverName.toLowerCase())) {
+      return tool.name;
     }
   }
 
-  if (candidates.length === 0) return null;
-  if (candidates.length === 1) return candidates[0];
-
-  for (const name of candidates) {
-    if (name.toLowerCase().includes(serverName.toLowerCase())) {
-      return name;
-    }
-  }
-
-  return candidates[0];
+  return null;
 }
 
 /**
@@ -832,9 +848,16 @@ export async function handleProxyAdminOperation(
     }
 
     await ensureSession();
+    const nestedArgs: Record<string, unknown> = { operation, server_name: remainingPath };
+    if (lines !== 50) nestedArgs.lines = lines;
     const resp = await mcpRequest("tools/call", {
-      name: nestedTool,
-      arguments: { operation, server_name: remainingPath, lines },
+      name: "call_tool_read",
+      arguments: {
+        name: nestedTool,
+        args_json: JSON.stringify(nestedArgs),
+        intent_reason: "Nested proxy_admin routing",
+        intent_data_sensitivity: "internal",
+      },
     });
 
     if (!resp || resp.error) {
@@ -868,8 +891,13 @@ export async function handleProxyAdminOperation(
           try {
             await ensureSession();
             const resp = await mcpRequest("tools/call", {
-              name: nestedTool,
-              arguments: { operation: "list" },
+              name: "call_tool_read",
+              arguments: {
+                name: nestedTool,
+                args_json: JSON.stringify({ operation: "list" }),
+                intent_reason: "Recursive proxy_admin list",
+                intent_data_sensitivity: "internal",
+              },
             });
             if (resp?.result) {
               (server as Record<string, unknown>).nested_servers =
