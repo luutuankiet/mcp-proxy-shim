@@ -41,9 +41,22 @@ const MOCK_ADMIN_SERVERS = [
 function handleMockAdminApi(req, res, pathname) {
   res.setHeader("Content-Type", "application/json");
 
+  // GET /api/v1/servers — list
   if (pathname === "/api/v1/servers" && req.method === "GET") {
     res.writeHead(200);
     res.end(JSON.stringify({ success: true, data: { servers: MOCK_ADMIN_SERVERS, stats: { total_servers: 3 } } }));
+    return;
+  }
+
+  // POST /api/v1/servers — add
+  if (pathname === "/api/v1/servers" && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, data: { action: "add", server: body.name, config: body } }));
+    });
     return;
   }
 
@@ -64,6 +77,111 @@ function handleMockAdminApi(req, res, pathname) {
   if (logsMatch && req.method === "GET") {
     res.writeHead(200);
     res.end(JSON.stringify({ success: true, data: { server: logsMatch[1], lines: ["mock log line 1", "mock log line 2"] } }));
+    return;
+  }
+
+  // DELETE /api/v1/servers/{id} — remove
+  const deleteMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)$/);
+  if (deleteMatch && req.method === "DELETE") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { action: "remove", server: deleteMatch[1] } }));
+    return;
+  }
+
+  // PATCH /api/v1/servers/{id} — patch
+  const patchMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)$/);
+  if (patchMatch && req.method === "PATCH") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, data: { action: "patch", server: patchMatch[1], config: body } }));
+    });
+    return;
+  }
+
+  // POST /api/v1/servers/{id}/enable
+  const enableMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/enable$/);
+  if (enableMatch && req.method === "POST") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { action: "enable", server: enableMatch[1] } }));
+    return;
+  }
+
+  // POST /api/v1/servers/{id}/disable
+  const disableMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/disable$/);
+  if (disableMatch && req.method === "POST") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { action: "disable", server: disableMatch[1] } }));
+    return;
+  }
+
+  // POST /api/v1/servers/{id}/quarantine
+  const quarantineMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/quarantine$/);
+  if (quarantineMatch && req.method === "POST") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { action: "quarantine", server: quarantineMatch[1] } }));
+    return;
+  }
+
+  // POST /api/v1/servers/{id}/unquarantine
+  const unquarantineMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/unquarantine$/);
+  if (unquarantineMatch && req.method === "POST") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { action: "unquarantine", server: unquarantineMatch[1] } }));
+    return;
+  }
+
+  // POST /api/v1/servers/{id}/tools/approve
+  const approveMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/tools\/approve$/);
+  if (approveMatch && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true, data: { action: "approve_tools", server: approveMatch[1], body } }));
+    });
+    return;
+  }
+
+  // GET /api/v1/servers/{id}/tools
+  const toolsMatch = pathname.match(/^\/api\/v1\/servers\/([^/]+)\/tools$/);
+  if (toolsMatch && req.method === "GET") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { tools: [{ name: "tool-a", approved: true }, { name: "tool-b", approved: false }] } }));
+    return;
+  }
+
+  // GET /api/v1/config
+  if (pathname === "/api/v1/config" && req.method === "GET") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { version: "mock-1.0", servers: MOCK_ADMIN_SERVERS } }));
+    return;
+  }
+
+  // GET /api/v1/index/search
+  if (pathname.startsWith("/api/v1/index/search") && req.method === "GET") {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const q = url.searchParams.get("q") || "";
+    const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { query: q, limit, results: [{ name: "matched-tool", score: 0.95 }] } }));
+    return;
+  }
+
+  // GET /api/v1/status
+  if (pathname === "/api/v1/status" && req.method === "GET") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ success: true, data: { state: "running", uptime: 12345 } }));
+    return;
+  }
+
+  // GET /swagger/doc.json
+  if (pathname === "/swagger/doc.json" && req.method === "GET") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ openapi: "3.0.0", info: { title: "mcpproxy-go", version: "1.0.0" }, paths: {} }));
     return;
   }
 
@@ -210,7 +328,7 @@ function startMockServer() {
       const reqUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
       // Admin API mock (for proxy_admin tests)
-      if (reqUrl.pathname.startsWith("/api/v1/")) {
+      if (reqUrl.pathname.startsWith("/api/v1/") || reqUrl.pathname.startsWith("/swagger/")) {
         return handleMockAdminApi(req, res, reqUrl.pathname);
       }
 
@@ -570,6 +688,243 @@ async function runTests() {
       !!dt?.inputSchema?.properties?.names,
       `schema: ${JSON.stringify(dt?.inputSchema).slice(0, 200)}`,
     );
+  }
+
+  // --- v1.6.0: New operation tests ---
+
+  console.log("\nTest: proxy_admin add");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "add", config: { name: "new-server", url: "http://localhost:9999/mcp", protocol: "http" } },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const addData = r.body?.data || r.body;
+    assert("has action add", addData?.action === "add", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+    assert("has server name", addData?.server === "new-server", `got: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin add (missing config)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "add" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin remove");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "remove", server_name: "server-a" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const rmData = r.body?.data || r.body;
+    assert("has action remove", rmData?.action === "remove", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin remove (missing server_name)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "remove" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin patch");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "patch", server_name: "server-a", config: { protocol: "streamable-http" } },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const patchData = r.body?.data || r.body;
+    assert("has action patch", patchData?.action === "patch", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin patch (missing config)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "patch", server_name: "server-a" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin enable");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "enable", server_name: "server-c" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const enData = r.body?.data || r.body;
+    assert("has action enable", enData?.action === "enable", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin disable");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "disable", server_name: "server-a" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const disData = r.body?.data || r.body;
+    assert("has action disable", disData?.action === "disable", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin quarantine");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "quarantine", server_name: "server-a" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const qData = r.body?.data || r.body;
+    assert("has action quarantine", qData?.action === "quarantine", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin unquarantine");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "unquarantine", server_name: "server-a" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const uqData = r.body?.data || r.body;
+    assert("has action unquarantine", uqData?.action === "unquarantine", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin approve_tools (with tools array)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "approve_tools", server_name: "server-a", tools: ["tool-a", "tool-b"] },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const appData = r.body?.data || r.body;
+    assert("has action approve_tools", appData?.action === "approve_tools", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin approve_tools (with approve_all)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "approve_tools", server_name: "server-a", approve_all: true },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin approve_tools (missing tools and approve_all)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "approve_tools", server_name: "server-a" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin inspect_config");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "inspect_config" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    assert("has config data", r.body?.version === "mock-1.0" || r.body?.data?.version === "mock-1.0", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin inspect_server");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "inspect_server", server_name: "server-a" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    assert("has server info", !!r.body?.server, `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+    assert("has tools info", !!r.body?.tools, `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+    assert("server name matches", r.body?.server?.name === "server-a", `got: ${r.body?.server?.name}`);
+  }
+
+  console.log("\nTest: proxy_admin inspect_server (missing server_name)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "inspect_server" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin search_tools");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "search_tools", query: "read files", limit: 5 },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    assert("has results", !!r.body?.results || !!r.body?.data?.results, `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: proxy_admin search_tools (missing query)");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "search_tools" },
+    });
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+  }
+
+  console.log("\nTest: proxy_admin status");
+  {
+    const r = await request("POST", "/call", {
+      name: "proxy_admin",
+      args: { operation: "status" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    assert("has state", !!r.body?.state || !!r.body?.data?.state, `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  // --- v1.6.0: First-class REST endpoint tests ---
+
+  console.log("\nTest: POST /proxy_admin (first-class endpoint)");
+  {
+    const r = await request("POST", "/proxy_admin", {
+      operation: "list",
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    assert("has servers array", Array.isArray(r.body?.servers), `body: ${JSON.stringify(r.body).slice(0, 300)}`);
+  }
+
+  console.log("\nTest: POST /proxy_admin (missing operation)");
+  {
+    const r = await request("POST", "/proxy_admin", {});
+    assert("status 400", r.status === 400, `got: ${r.status}`);
+    assert("has error", !!r.body?.error, `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: POST /proxy_admin add via REST");
+  {
+    const r = await request("POST", "/proxy_admin", {
+      operation: "add",
+      config: { name: "rest-server", url: "http://localhost:8888/mcp", protocol: "sse" },
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const restAddData = r.body?.data || r.body;
+    assert("has action add", restAddData?.action === "add", `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+  }
+
+  console.log("\nTest: GET /proxy_admin/schema");
+  {
+    const r = await request("GET", "/proxy_admin/schema");
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    assert("has properties", !!r.body?.properties, `body: ${JSON.stringify(r.body).slice(0, 200)}`);
+    assert("has operation enum", Array.isArray(r.body?.properties?.operation?.enum), `body: ${JSON.stringify(r.body?.properties?.operation).slice(0, 200)}`);
+    const ops = r.body?.properties?.operation?.enum || [];
+    assert("has 16 operations", ops.length === 16, `got: ${ops.length} — ${ops}`);
+    assert("includes add", ops.includes("add"), `ops: ${ops}`);
+    assert("includes search_tools", ops.includes("search_tools"), `ops: ${ops}`);
   }
 
   // Unknown endpoint test

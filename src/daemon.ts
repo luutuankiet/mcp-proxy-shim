@@ -532,7 +532,15 @@ async function handleCall(
       const result = await handleProxyAdminOperation(
         (args.operation ?? "") as string,
         (args.server_name ?? "") as string,
-        { lines: (args.lines ?? 50) as number, recursive: (args.recursive ?? false) as boolean },
+        {
+          lines: (args.lines ?? 50) as number,
+          recursive: (args.recursive ?? false) as boolean,
+          config: args.config as Record<string, unknown> | undefined,
+          tools: args.tools as string[] | undefined,
+          approve_all: args.approve_all as boolean | undefined,
+          query: args.query as string | undefined,
+          limit: args.limit as number | undefined,
+        },
       );
       return jsonResponse(res, result.isError ? 400 : 200, result.data);
     } catch (err) {
@@ -642,6 +650,44 @@ async function handleReinit(
       ok: false,
       error: (err as Error).message,
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// First-class proxy_admin REST endpoint (v1.6.0)
+// ---------------------------------------------------------------------------
+
+async function handleProxyAdminRest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await parseBody(req);
+  const operation = body.operation as string;
+  if (!operation) {
+    return jsonResponse(res, 400, { error: "operation is required" });
+  }
+  try {
+    await ensureSession();
+    callCount++;
+    const result = await handleProxyAdminOperation(
+      operation,
+      (body.server_name as string) || "",
+      {
+        lines: body.lines as number | undefined,
+        recursive: body.recursive as boolean | undefined,
+        config: body.config as Record<string, unknown> | undefined,
+        tools: body.tools as string[] | undefined,
+        approve_all: body.approve_all as boolean | undefined,
+        query: body.query as string | undefined,
+        limit: body.limit as number | undefined,
+      },
+    );
+    if (result.isError) {
+      return jsonResponse(res, 400, result.data);
+    }
+    return jsonResponse(res, 200, result.data);
+  } catch (err) {
+    return jsonResponse(res, 500, { error: (err as Error).message });
   }
 }
 
@@ -804,6 +850,14 @@ async function main() {
         return handleMcpRequest(req, res);
       }
 
+      // First-class proxy_admin endpoint (v1.6.0)
+      if (pathname === "/proxy_admin" && req.method === "POST") {
+        return handleProxyAdminRest(req, res);
+      }
+      if (pathname === "/proxy_admin/schema" && req.method === "GET") {
+        return jsonResponse(res, 200, PROXY_ADMIN_SCHEMA.inputSchema);
+      }
+
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not Found" }));
     };
@@ -819,7 +873,7 @@ async function main() {
 
   httpServer.listen(PORT, HOST, () => {
     log(`Daemon listening on http://${HOST}:${PORT}`);
-    log("REST endpoints: /health, /retrieve_tools, /describe_tools, /call, /exec, /reinit");
+    log("REST endpoints: /health, /retrieve_tools, /describe_tools, /call, /exec, /reinit, /proxy_admin");
     log("MCP endpoint: /mcp");
     log(`Auth: ${APIKEY ? "apikey required (?apikey=...)" : "OPEN (no MCP_APIKEY set)"}`);
   });

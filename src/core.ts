@@ -80,23 +80,26 @@ export const DESCRIBE_TOOLS_SCHEMA: ToolSchema = {
 export const PROXY_ADMIN_SCHEMA: ToolSchema = {
   name: "proxy_admin",
   description:
-    "Manage the upstream MCP proxy — list connected servers, restart specific upstreams, " +
-    "reconnect all, or tail server logs. Use for blip recovery when upstream tools drop. " +
+    "Manage the upstream MCP proxy — list/add/remove/patch servers, enable/disable/quarantine, " +
+    "approve tools, inspect config, search tools, tail logs. Use for blip recovery and server management. " +
     "Supports nested proxy chains via path notation (e.g., server_name: \"thinkpad/personal\").",
   inputSchema: {
     type: "object",
     properties: {
       operation: {
         type: "string",
-        enum: ["list", "restart", "reconnect", "tail_log"],
+        enum: ["list", "restart", "reconnect", "tail_log", "add", "remove", "patch", "enable", "disable", "quarantine", "unquarantine", "approve_tools", "inspect_config", "inspect_server", "search_tools", "status"],
         description:
-          "list: show servers with health status. restart: restart one server by name. " +
-          "reconnect: reconnect all servers. tail_log: show recent logs for a server.",
+          "list: show servers with health status. restart: restart one server. reconnect: reconnect all. " +
+          "tail_log: show recent logs. add: add a new server. remove: delete a server. patch: update server config. " +
+          "enable/disable: toggle server. quarantine/unquarantine: toggle quarantine. " +
+          "approve_tools: approve pending tools. inspect_config: show full config. inspect_server: show server details + tools. " +
+          "search_tools: BM25 search the tool index. status: running state.",
       },
       server_name: {
         type: "string",
         description:
-          "Server name (required for restart/tail_log). " +
+          "Server name (required for restart/tail_log/remove/patch/enable/disable/quarantine/unquarantine/approve_tools/inspect_server). " +
           "Path notation for nested proxies: \"thinkpad/personal\" routes through thinkpad's proxy_admin.",
       },
       lines: {
@@ -106,6 +109,29 @@ export const PROXY_ADMIN_SCHEMA: ToolSchema = {
       recursive: {
         type: "boolean",
         description: "For list: include servers from nested shim-wrapped upstreams.",
+      },
+      config: {
+        type: "object",
+        description:
+          "Server configuration for add/patch operations. Fields: name, url, command, args, env, headers, " +
+          "working_dir, protocol (stdio|http|streamable-http|sse|auto), enabled, quarantined, reconnect_on_use.",
+      },
+      tools: {
+        type: "array",
+        items: { type: "string" },
+        description: "Tool names for approve_tools operation.",
+      },
+      approve_all: {
+        type: "boolean",
+        description: "Approve all pending tools (approve_tools operation).",
+      },
+      query: {
+        type: "string",
+        description: "Search query for search_tools operation.",
+      },
+      limit: {
+        type: "number",
+        description: "Max results for search_tools (default: 10).",
       },
     },
     required: ["operation"],
@@ -172,6 +198,7 @@ function getAdminApiKey(): string {
 export async function adminRequest(
   method: string,
   path: string,
+  body?: unknown,
 ): Promise<{ status: number; data: unknown }> {
   const baseUrl = getAdminBaseUrl();
   const fullUrl = `${baseUrl}${path}`;
@@ -186,6 +213,7 @@ export async function adminRequest(
     method,
     headers,
     signal: AbortSignal.timeout(10_000),
+    body: body ? JSON.stringify(body) : undefined,
   };
   if (proxyDispatcher) {
     fetchOpts.dispatcher = proxyDispatcher;
@@ -829,7 +857,15 @@ async function discoverNestedProxyAdmin(serverName: string): Promise<string | nu
 export async function handleProxyAdminOperation(
   operation: string,
   serverName: string,
-  options: { lines?: number; recursive?: boolean } = {},
+  options: {
+    lines?: number;
+    recursive?: boolean;
+    config?: Record<string, unknown>;
+    tools?: string[];
+    approve_all?: boolean;
+    query?: string;
+    limit?: number;
+  } = {},
 ): Promise<{ data: unknown; isError?: boolean }> {
   const { lines = 50, recursive = false } = options;
 
@@ -932,6 +968,119 @@ export async function handleProxyAdminOperation(
       return { data: { error: "server_name is required for tail_log" }, isError: true };
     }
     const result = await adminRequest("GET", `servers/${encodeURIComponent(serverName)}/logs?lines=${lines}`);
+    return { data: result.data };
+  }
+
+  // --- v1.6.0: Expanded operations ---
+
+  if (operation === "add") {
+    const config = options.config;
+    if (!config || !config.name) {
+      return { data: { error: "config with at least 'name' is required for add" }, isError: true };
+    }
+    const result = await adminRequest("POST", "servers", config);
+    return { data: result.data };
+  }
+
+  if (operation === "remove") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for remove" }, isError: true };
+    }
+    const result = await adminRequest("DELETE", `servers/${encodeURIComponent(serverName)}`);
+    return { data: result.data };
+  }
+
+  if (operation === "patch") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for patch" }, isError: true };
+    }
+    const config = options.config;
+    if (!config) {
+      return { data: { error: "config is required for patch" }, isError: true };
+    }
+    const result = await adminRequest("PATCH", `servers/${encodeURIComponent(serverName)}`, config);
+    return { data: result.data };
+  }
+
+  if (operation === "enable") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for enable" }, isError: true };
+    }
+    const result = await adminRequest("POST", `servers/${encodeURIComponent(serverName)}/enable`);
+    return { data: result.data };
+  }
+
+  if (operation === "disable") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for disable" }, isError: true };
+    }
+    const result = await adminRequest("POST", `servers/${encodeURIComponent(serverName)}/disable`);
+    return { data: result.data };
+  }
+
+  if (operation === "quarantine") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for quarantine" }, isError: true };
+    }
+    const result = await adminRequest("POST", `servers/${encodeURIComponent(serverName)}/quarantine`);
+    return { data: result.data };
+  }
+
+  if (operation === "unquarantine") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for unquarantine" }, isError: true };
+    }
+    const result = await adminRequest("POST", `servers/${encodeURIComponent(serverName)}/unquarantine`);
+    return { data: result.data };
+  }
+
+  if (operation === "approve_tools") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for approve_tools" }, isError: true };
+    }
+    const body: Record<string, unknown> = {};
+    if (options.approve_all) {
+      body.approve_all = true;
+    } else if (options.tools && Array.isArray(options.tools)) {
+      body.tools = options.tools;
+    } else {
+      return { data: { error: "Either tools array or approve_all=true required" }, isError: true };
+    }
+    const result = await adminRequest("POST", `servers/${encodeURIComponent(serverName)}/tools/approve`, body);
+    return { data: result.data };
+  }
+
+  if (operation === "inspect_config") {
+    const result = await adminRequest("GET", "config");
+    return { data: result.data };
+  }
+
+  if (operation === "inspect_server") {
+    if (!serverName) {
+      return { data: { error: "server_name is required for inspect_server" }, isError: true };
+    }
+    const [serversResult, toolsResult] = await Promise.all([
+      adminRequest("GET", "servers"),
+      adminRequest("GET", `servers/${encodeURIComponent(serverName)}/tools`),
+    ]);
+    const serversData = serversResult.data as Record<string, unknown>;
+    const allServers = ((serversData?.data as Record<string, unknown>)?.servers as Record<string, unknown>[]) || [];
+    const server = allServers.find(s => s.name === serverName);
+    return { data: { server: server || { error: "server not found" }, tools: toolsResult.data } };
+  }
+
+  if (operation === "search_tools") {
+    const query = options.query;
+    if (!query) {
+      return { data: { error: "query is required for search_tools" }, isError: true };
+    }
+    const limit = options.limit || 10;
+    const result = await adminRequest("GET", `index/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+    return { data: result.data };
+  }
+
+  if (operation === "status") {
+    const result = await adminRequest("GET", "status");
     return { data: result.data };
   }
 
@@ -1096,9 +1245,14 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       const serverName = (args?.server_name ?? "") as string;
       const lines = (args?.lines ?? 50) as number;
       const recursive = (args?.recursive ?? false) as boolean;
+      const config = args?.config as Record<string, unknown> | undefined;
+      const tools = args?.tools as string[] | undefined;
+      const approve_all = args?.approve_all as boolean | undefined;
+      const query = args?.query as string | undefined;
+      const limit = args?.limit as number | undefined;
 
       try {
-        const result = await handleProxyAdminOperation(operation, serverName, { lines, recursive });
+        const result = await handleProxyAdminOperation(operation, serverName, { lines, recursive, config, tools, approve_all, query, limit });
         const text = typeof result.data === "string" ? result.data : JSON.stringify(result.data);
         return {
           content: [{ type: "text" as const, text }],

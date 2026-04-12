@@ -67,10 +67,15 @@ if (subcommand === "--help" || subcommand === "-h") {
   console.log("  POST /call            { method, name, args }");
   console.log("  POST /exec            { code }");
   console.log("  POST /reinit          Force new upstream session");
+  console.log("  POST /proxy_admin     First-class proxy admin (v1.6.0) { operation, ... }");
+  console.log("  GET  /proxy_admin/schema  Returns proxy_admin inputSchema");
   console.log("  POST /mcp             Streamable HTTP (backward compat)");
   console.log("");
   console.log("Daemon built-in tools (shim-local, surfaced in discovery):");
-  console.log("  proxy_admin      Manage upstream MCP proxy (list/restart/reconnect/tail_log)");
+  console.log("  proxy_admin      Manage upstream MCP proxy (16 operations):");
+  console.log("                   list, restart, reconnect, tail_log, add, remove, patch,");
+  console.log("                   enable, disable, quarantine, unquarantine, approve_tools,");
+  console.log("                   inspect_config, inspect_server, search_tools, status");
   console.log("  describe_tools   Batch-hydrate tool schemas by name");
   console.log("");
   console.log("Passthru mode (generic MCP→REST bridge):");
