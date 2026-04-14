@@ -174,6 +174,29 @@ export function compactTool(tool: ProxyTool): ProxyTool {
 }
 
 // ---------------------------------------------------------------------------
+// v1.6.2 — retrieve_tools over-request (compensate for M1 dedup post-slice)
+// ---------------------------------------------------------------------------
+
+/**
+ * v1.6.2 fix: over-request upstream retrieve_tools limit so the post-dedup
+ * shim-side slice still has N unique entries to return. Without this, host
+ * duplicates consume the upstream BM25 limit budget before dedup folds them,
+ * and the agent sees fewer unique tools than they asked for.
+ *
+ * Returns a shallow clone with bumped limit; never mutates input. Caps at
+ * 100 per mcpproxy-go's internal/server/mcp.go:931-933 hard limit.
+ */
+export function applyRetrieveOverRequest(
+  body: Record<string, unknown>,
+  multiplier: number,
+): Record<string, unknown> {
+  const limit = typeof body.limit === "number" ? body.limit : 0;
+  if (limit <= 0) return body;
+  const bumped = Math.min(Math.ceil(limit * multiplier), 100);
+  return { ...body, limit: bumped };
+}
+
+// ---------------------------------------------------------------------------
 // M1 — dedupTools
 // ---------------------------------------------------------------------------
 

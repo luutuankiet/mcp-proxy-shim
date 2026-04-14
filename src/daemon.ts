@@ -55,8 +55,9 @@ import {
   PROXY_ADMIN_SCHEMA,
   DESCRIBE_TOOLS_SCHEMA,
   SHIM_COMPACT_ENABLED,
+  SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER,
 } from "./core.js";
-import { compactTool, type ProxyTool } from "./middleware.js";
+import { compactTool, applyRetrieveOverRequest, type ProxyTool } from "./middleware.js";
 
 // ---------------------------------------------------------------------------
 // Shim-local tool discovery entries
@@ -338,9 +339,13 @@ async function handleRetrieveTools(
     await ensureSession();
     callCount++;
 
+    // v1.6.2: over-request upstream so post-dedup slice still has N unique entries.
+    // Pass ORIGINAL body to compactRetrieveTools below for the user-facing slice.
+    const upstreamBody = applyRetrieveOverRequest(body, SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER);
+
     const resp = await mcpRequest("tools/call", {
       name: "retrieve_tools",
-      arguments: body,
+      arguments: upstreamBody,
     });
 
     if (!resp || resp.error) {

@@ -31,6 +31,9 @@ let passed = 0;
 let failed = 0;
 const mockSessionId = "mock-session-" + Date.now();
 
+// v1.6.2: tally upstream retrieve_tools calls so tests can verify limit bumping.
+const mockUpstreamCalls = [];
+
 // Mock admin API server list
 const MOCK_ADMIN_SERVERS = [
   { name: "server-a", health: { summary: "Connected (10 tools)" }, enabled: true, url: "http://localhost:1111/mcp/all/", protocol: "http" },
@@ -310,6 +313,7 @@ function handleMockRpc(body) {
     const args = params?.arguments || {};
 
     if (toolName === "retrieve_tools") {
+      mockUpstreamCalls.push({ query: args.query, limit: args.limit });
       const query = (args.query || "").toLowerCase();
       const matched = MOCK_TOOLS.filter(
         (t) =>
@@ -1119,6 +1123,81 @@ async function runTests() {
         "compact OFF → _meta preserved",
         altBlob.includes('"_meta"'),
         `blob: ${altBlob.slice(0, 200)}`,
+      );
+    } finally {
+      altDaemon.kill("SIGTERM");
+    }
+  }
+
+  // ----------------------------------------------------------------------
+  // v1.6.2 retrieve_tools limit over-request
+  // ----------------------------------------------------------------------
+
+  console.log("\nTest: retrieve_tools limit over-request (v1.6.2 fix)");
+  {
+    mockUpstreamCalls.length = 0;
+    // FLEET_TOOLS provides 10 byte-identical fs-mcp duplicates. Pre-v1.6.2,
+    // dedup collapsed them post-upstream-slice and the user got fewer unique
+    // tools than requested. Now upstream is over-requested by 3x (default).
+    const r = await request("POST", "/retrieve_tools", { query: "read_files", limit: 5 });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const tools = r.body?.tools || (Array.isArray(r.body) ? r.body : []);
+    assert(
+      "returns up to 5 entries (user's limit respected after dedup)",
+      tools.length > 0 && tools.length <= 5,
+      `got ${tools.length}`,
+    );
+    const retrieveCalls = mockUpstreamCalls.filter((c) => typeof c.limit === "number");
+    const lastUpstreamCall = retrieveCalls[retrieveCalls.length - 1];
+    assert(
+      "upstream received bumped limit (5 * 3 = 15)",
+      lastUpstreamCall?.limit === 15,
+      `got upstream limit=${lastUpstreamCall?.limit}`,
+    );
+  }
+
+  console.log("\nTest: SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER env override (5x)");
+  {
+    const altDaemon = await startSecondaryDaemon(DAEMON_PORT + 2, {
+      SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER: "5",
+    });
+    try {
+      mockUpstreamCalls.length = 0;
+      const r = await requestPort(DAEMON_PORT + 2, "POST", "/retrieve_tools", {
+        query: "read_files",
+        limit: 10,
+      });
+      assert("status 200 (alt daemon multiplier=5)", r.status === 200, `got: ${r.status}`);
+      const retrieveCalls = mockUpstreamCalls.filter((c) => typeof c.limit === "number");
+      const lastUpstreamCall = retrieveCalls[retrieveCalls.length - 1];
+      assert(
+        "upstream received bumped limit (10 * 5 = 50)",
+        lastUpstreamCall?.limit === 50,
+        `got upstream limit=${lastUpstreamCall?.limit}`,
+      );
+    } finally {
+      altDaemon.kill("SIGTERM");
+    }
+  }
+
+  console.log("\nTest: SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER caps at 100");
+  {
+    const altDaemon = await startSecondaryDaemon(DAEMON_PORT + 3, {
+      SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER: "10",
+    });
+    try {
+      mockUpstreamCalls.length = 0;
+      const r = await requestPort(DAEMON_PORT + 3, "POST", "/retrieve_tools", {
+        query: "read_files",
+        limit: 30,
+      });
+      assert("status 200 (alt daemon multiplier=10)", r.status === 200, `got: ${r.status}`);
+      const retrieveCalls = mockUpstreamCalls.filter((c) => typeof c.limit === "number");
+      const lastUpstreamCall = retrieveCalls[retrieveCalls.length - 1];
+      assert(
+        "upstream limit capped at 100 (30 * 10 would be 300)",
+        lastUpstreamCall?.limit === 100,
+        `got upstream limit=${lastUpstreamCall?.limit}`,
       );
     } finally {
       altDaemon.kill("SIGTERM");

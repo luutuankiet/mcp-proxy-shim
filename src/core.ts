@@ -11,7 +11,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { dedupTools, compactTool, type ProxyTool } from "./middleware.js";
+import { dedupTools, compactTool, applyRetrieveOverRequest, type ProxyTool } from "./middleware.js";
 
 // TLS: Ensure insecure mode is set when core.ts is imported directly
 // (not through index.ts). Covers stdio.ts, http-server.ts direct imports.
@@ -46,6 +46,14 @@ const MAX_RESULT_CHARS = parseInt(process.env.MCP_MAX_RESULT_CHARS || "500000", 
 // v1.6.1 shim-trim middleware kill-switches (default = enabled). See WORK.md DECISION-012.
 export const SHIM_DEDUP_ENABLED = process.env.SHIM_DISABLE_DEDUP !== "1";
 export const SHIM_COMPACT_ENABLED = process.env.SHIM_DISABLE_COMPACT !== "1";
+
+// v1.6.2 retrieve_tools over-request multiplier (default 3). See DECISION-021 in WORK.md.
+// Floor 1 (never shrink below user's requested limit). Helper caps hard at 100
+// per mcpproxy-go's internal/server/mcp.go:931-933 limit.
+export const SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER = Math.max(
+  1,
+  parseFloat(process.env.SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER || "3"),
+);
 
 // Auto-detect HTTPS proxy from environment
 const PROXY_URL = process.env.https_proxy || process.env.HTTPS_PROXY || "";
@@ -1302,6 +1310,13 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
         };
       }
       throw err;
+    }
+
+    // v1.6.2: over-request upstream so post-dedup slice still has N unique entries.
+    // compactRetrieveTools below still receives the ORIGINAL args (unbumped limit)
+    // for the shim-side slice.
+    if (name === "retrieve_tools") {
+      forwardArgs = applyRetrieveOverRequest(forwardArgs, SHIM_RETRIEVE_OVERREQUEST_MULTIPLIER);
     }
 
     try {
