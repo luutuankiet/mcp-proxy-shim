@@ -54,7 +54,9 @@ import {
   handleProxyAdminOperation,
   PROXY_ADMIN_SCHEMA,
   DESCRIBE_TOOLS_SCHEMA,
+  SHIM_COMPACT_ENABLED,
 } from "./core.js";
+import { compactTool, type ProxyTool } from "./middleware.js";
 
 // ---------------------------------------------------------------------------
 // Shim-local tool discovery entries
@@ -495,7 +497,13 @@ async function handleDescribeTools(
       return { name: n, error: "not found" };
     });
 
-    return jsonResponse(res, 200, results);
+    // M2 compact — strip schema cruft + flatten read_files reads[] before serving.
+    // Mirrors core.ts MCP describe_tools handler. See WORK.md DECISION-011.
+    const compacted = SHIM_COMPACT_ENABLED
+      ? results.map((t) => (t && typeof t === "object" ? compactTool(t as ProxyTool) : t))
+      : results;
+
+    return jsonResponse(res, 200, compacted);
   } catch (err) {
     return jsonResponse(res, 500, { error: (err as Error).message });
   }

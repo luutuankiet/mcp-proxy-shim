@@ -193,7 +193,7 @@ function handleMockAdminApi(req, res, pathname) {
 // Mock MCP Upstream
 // ---------------------------------------------------------------------------
 
-const MOCK_TOOLS = [
+const MOCK_BASE_TOOLS = [
   {
     name: "retrieve_tools",
     description: "Search for tools by keyword",
@@ -219,6 +219,68 @@ const MOCK_TOOLS = [
     },
   },
 ];
+
+// v1.6.1 shim-trim fixtures — 10 byte-identical fs-mcp duplicates across hosts.
+// Used to exercise M1 dedup + M2 compact end-to-end through the daemon.
+const FLEET_HOSTS = [
+  "alpha_at_slash", "bravo_at_slash", "charlie_at_slash", "delta_at_slash", "echo_at_slash",
+  "foxtrot_at_slash", "golf_at_slash", "hotel_at_slash", "india_at_slash", "juliet_at_slash",
+];
+const FLEET_DESCRIPTION_BODY =
+  "Read the contents of multiple files simultaneously. " +
+  "This is the canonical fs-mcp tool description that ships byte-identical across all fleet hosts.";
+const FLEET_INPUTSCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  additionalProperties: false,
+  title: "ReadFilesInput",
+  type: "object",
+  properties: {
+    files: {
+      type: "array",
+      description: "Files to read.",
+      items: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File path. Prefer relative." },
+          head: { type: "integer", nullable: true, description: "Read N from start. Cannot mix with start_line." },
+          tail: { type: "integer", nullable: true, description: "Read N from end. Cannot mix with start_line." },
+          start_line: { type: "integer", nullable: true, description: "1-based start line." },
+          end_line: { type: "integer", nullable: true, description: "1-based end line (inclusive)." },
+          read_to_next_pattern: { type: "string", nullable: true, description: "Section-aware terminator regex." },
+          reads: {
+            type: "array",
+            nullable: true,
+            description: "Multi-read spec list. Mode fields mutually exclusive within an item.",
+            items: {
+              type: "object",
+              properties: {
+                head: { type: "integer", nullable: true, description: "Read N from start. Cannot mix with start_line." },
+                tail: { type: "integer", nullable: true, description: "Read N from end. Cannot mix with start_line." },
+                start_line: { type: "integer", nullable: true, description: "1-based start line." },
+                end_line: { type: "integer", nullable: true, description: "1-based end line (inclusive)." },
+                read_to_next_pattern: { type: "string", nullable: true, description: "Section-aware terminator regex." },
+              },
+            },
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  required: ["files"],
+};
+const FLEET_TOOLS = FLEET_HOSTS.map((host) => ({
+  server: host,
+  name: `${host}__read_files`,
+  description: `[${host}] ${FLEET_DESCRIPTION_BODY}`,
+  inputSchema: FLEET_INPUTSCHEMA,
+  annotations: { destructiveHint: true, openWorldHint: true, readOnlyHint: false },
+  call_with: "call_tool_destructive",
+  score: 10.5,
+  _meta: { "anthropic/maxResultSizeChars": 500000 },
+}));
+
+const MOCK_TOOLS = [...MOCK_BASE_TOOLS, ...FLEET_TOOLS];
 
 function mockJsonRpcResponse(id, result) {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
@@ -934,7 +996,189 @@ async function runTests() {
     assert("status 404", r.status === 404, `got: ${r.status}`);
   }
 
+  // ----------------------------------------------------------------------
+  // v1.6.1 shim-trim middleware tests (M1 dedup + M2 compact)
+  // ----------------------------------------------------------------------
+
+  console.log("\nTest: POST /retrieve_tools (M1 dedup folds host duplicates)");
+  {
+    const r = await request("POST", "/retrieve_tools", { query: "read_files" });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const tools = r.body?.tools || (Array.isArray(r.body) ? r.body : []);
+    const fleetEntries = tools.filter((t) => (t?.name || "").endsWith("__read_files"));
+    assert(
+      "10 host duplicates fold into 1 canonical entry",
+      fleetEntries.length === 1,
+      `got ${fleetEntries.length}: ${fleetEntries.map((t) => t.name).join(", ")}`,
+    );
+    const canonical = fleetEntries[0];
+    assert(
+      "canonical entry has servers[] of length 10",
+      Array.isArray(canonical?.servers) && canonical.servers.length === 10,
+      `got: ${JSON.stringify(canonical?.servers)}`,
+    );
+    assert(
+      "servers[] contains alpha_at_slash + juliet_at_slash",
+      canonical?.servers?.includes("alpha_at_slash") && canonical?.servers?.includes("juliet_at_slash"),
+      `got: ${JSON.stringify(canonical?.servers)}`,
+    );
+    assert(
+      "singleton 'server' field removed on collapse",
+      canonical?.server === undefined,
+      `got: ${canonical?.server}`,
+    );
+    assert(
+      "description prefix '[host] ' stripped on collapse",
+      typeof canonical?.description === "string" && !canonical.description.startsWith("["),
+      `got: ${(canonical?.description || "").slice(0, 80)}`,
+    );
+  }
+
+  console.log("\nTest: POST /describe_tools (M2 strips $schema/_meta/score/title/additionalProperties)");
+  {
+    const r = await request("POST", "/describe_tools", {
+      names: ["alpha_at_slash__read_files"],
+    });
+    assert("status 200", r.status === 200, `got: ${r.status}`);
+    const results = Array.isArray(r.body) ? r.body : [r.body];
+    assert("returned 1 result", results.length === 1, `got: ${results.length}`);
+    const tool = results[0];
+    assert("resolved tool (no error)", tool && !tool.error, `got: ${JSON.stringify(tool).slice(0, 200)}`);
+
+    const blob = JSON.stringify(tool);
+    for (const key of ["$schema", "additionalProperties", "_meta", "score", "title"]) {
+      assert(
+        `compact stripped key: ${key}`,
+        !blob.includes(`"${key}"`),
+        `key '${key}' still present in: ${blob.slice(0, 200)}`,
+      );
+    }
+  }
+
+  console.log("\nTest: POST /describe_tools (M2 flattens read_files reads[] structural dup)");
+  {
+    const r = await request("POST", "/describe_tools", {
+      names: ["alpha_at_slash__read_files"],
+    });
+    assert("status 200", r.status === 200);
+    const tool = (Array.isArray(r.body) ? r.body : [r.body])[0];
+    const innerHead =
+      tool?.inputSchema?.properties?.files?.items?.properties?.reads?.items?.properties?.head;
+    assert(
+      "reads[].head description rewritten to parent pointer",
+      typeof innerHead?.description === "string" && innerHead.description.startsWith("See parent file item."),
+      `got: ${JSON.stringify(innerHead)}`,
+    );
+    const parentHeadDesc =
+      tool?.inputSchema?.properties?.files?.items?.properties?.head?.description;
+    assert(
+      "parent files[].head description preserved verbatim",
+      typeof parentHeadDesc === "string" && parentHeadDesc.includes("Read N from start"),
+      `got: ${parentHeadDesc}`,
+    );
+  }
+
+  // ----------------------------------------------------------------------
+  // v1.6.1 kill-switch test — spawn a second daemon with M1+M2 disabled,
+  // confirm pre-middleware behavior (no dedup, no schema strip).
+  // ----------------------------------------------------------------------
+
+  console.log("\nTest: SHIM_DISABLE_DEDUP / SHIM_DISABLE_COMPACT env kill-switches");
+  {
+    const altDaemon = await startSecondaryDaemon(DAEMON_PORT + 1, {
+      SHIM_DISABLE_DEDUP: "1",
+      SHIM_DISABLE_COMPACT: "1",
+    });
+    try {
+      const altR = await requestPort(DAEMON_PORT + 1, "POST", "/retrieve_tools", { query: "read_files" });
+      assert("status 200 (alt daemon)", altR.status === 200, `got: ${altR.status}`);
+      const altTools = altR.body?.tools || (Array.isArray(altR.body) ? altR.body : []);
+      const altFleet = altTools.filter((t) => (t?.name || "").endsWith("__read_files"));
+      assert(
+        "dedup OFF → all 10 host entries returned individually",
+        altFleet.length === 10,
+        `got ${altFleet.length}`,
+      );
+      assert(
+        "dedup OFF → entries keep 'server' singleton, no 'servers' array",
+        altFleet.every((t) => typeof t.server === "string" && !Array.isArray(t.servers)),
+        `sample: ${JSON.stringify(altFleet[0]).slice(0, 200)}`,
+      );
+
+      const altDescribe = await requestPort(DAEMON_PORT + 1, "POST", "/describe_tools", {
+        names: ["alpha_at_slash__read_files"],
+      });
+      const altTool = (Array.isArray(altDescribe.body) ? altDescribe.body : [altDescribe.body])[0];
+      const altBlob = JSON.stringify(altTool);
+      assert(
+        "compact OFF → $schema preserved",
+        altBlob.includes('"$schema"'),
+        `blob: ${altBlob.slice(0, 200)}`,
+      );
+      assert(
+        "compact OFF → _meta preserved",
+        altBlob.includes('"_meta"'),
+        `blob: ${altBlob.slice(0, 200)}`,
+      );
+    } finally {
+      altDaemon.kill("SIGTERM");
+    }
+  }
+
   console.log(`\n--- Results: ${passed} passed, ${failed} failed ---\n`);
+}
+
+// Spawn a second daemon for env-flag testing. Caller is responsible for kill().
+function startSecondaryDaemon(port, extraEnv) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("node", [DAEMON_PATH], {
+      env: {
+        ...process.env,
+        MCP_URL: MOCK_URL,
+        MCP_PORT: String(port),
+        MCP_HOST: "127.0.0.1",
+        ...extraEnv,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      if (text.includes("Daemon listening")) {
+        setTimeout(() => resolve(child), 200);
+      }
+    });
+    child.on("error", reject);
+    setTimeout(() => reject(new Error(`Secondary daemon failed within 10s: ${stderr.slice(-300)}`)), 10000);
+  });
+}
+
+function requestPort(port, method, path, body) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: "127.0.0.1",
+      port,
+      path,
+      method,
+      headers: { "Content-Type": "application/json" },
+      timeout: 15000,
+    };
+    const req = http.request(opts, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf-8");
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch { parsed = raw; }
+        resolve({ status: res.statusCode, body: parsed, raw });
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("Request timeout")));
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
 }
 
 // ---------------------------------------------------------------------------

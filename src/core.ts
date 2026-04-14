@@ -11,6 +11,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { dedupTools, compactTool, type ProxyTool } from "./middleware.js";
 
 // TLS: Ensure insecure mode is set when core.ts is imported directly
 // (not through index.ts). Covers stdio.ts, http-server.ts direct imports.
@@ -41,6 +42,10 @@ export const MAX_RETRIES = 2;
 // With annotation: ceiling rises to min(this value, 500000 chars) (IU6=500000).
 // Set MCP_MAX_RESULT_CHARS=0 to disable annotation entirely.
 const MAX_RESULT_CHARS = parseInt(process.env.MCP_MAX_RESULT_CHARS || "500000", 10);
+
+// v1.6.1 shim-trim middleware kill-switches (default = enabled). See WORK.md DECISION-012.
+export const SHIM_DEDUP_ENABLED = process.env.SHIM_DISABLE_DEDUP !== "1";
+export const SHIM_COMPACT_ENABLED = process.env.SHIM_DISABLE_COMPACT !== "1";
 
 // Auto-detect HTTPS proxy from environment
 const PROXY_URL = process.env.https_proxy || process.env.HTTPS_PROXY || "";
@@ -691,6 +696,20 @@ export function compactRetrieveTools(
     ? result
     : (result && Array.isArray(result.tools) ? result.tools as unknown[] : undefined);
 
+  // M1 (always-on) — fold byte-identical fs-mcp dupes into one canonical entry.
+  // Runs BEFORE the threshold check so the duplication win lands regardless of
+  // payload size. See WORK.md DECISION-010.
+  if (SHIM_DEDUP_ENABLED && tools) {
+    tools = dedupTools(tools);
+  }
+
+  // M2 (always-on) — strip lossless schema cruft from each tool entry.
+  // Applies inside retrieve_tools so inputSchemas that ride along get trimmed
+  // even when the response is small. See WORK.md DECISION-011.
+  if (SHIM_COMPACT_ENABLED && tools) {
+    tools = tools.map((t) => (t && typeof t === "object" ? compactTool(t as ProxyTool) : t));
+  }
+
   let wasCompacted = false;
   if (compact && tools) {
     const fullJson = JSON.stringify(tools);
@@ -700,6 +719,7 @@ export function compactRetrieveTools(
         const tool = t as Record<string, unknown>;
         return {
           server: tool.server,
+          servers: tool.servers,
           name: tool.name,
           call_with: tool.call_with,
           description: typeof tool.description === "string"
@@ -1229,7 +1249,10 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
 
       const results = names.map((n) => {
         const tool = resolveToolFromIndex(n, index);
-        if (tool) return transformToolSchema(tool);
+        if (tool) {
+          const transformed = transformToolSchema(tool);
+          return SHIM_COMPACT_ENABLED ? compactTool(transformed as ProxyTool) : transformed;
+        }
         return { name: n, error: "not found" };
       });
 
