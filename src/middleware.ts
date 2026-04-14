@@ -208,26 +208,41 @@ export interface DedupOptions {
 }
 
 /**
- * Fold byte-identical tools across hosts into a single canonical entry with
- * `servers: [...]`. Dedup key is
- * `sha256(suffix + "\n" + stripped_description + "\n" + canonical(annotations) [+ "\n" + canonical(inputSchema)])`.
+ * v1.6.3: fold tools that represent the SAME mount reachable via multiple
+ * proxy gateways into a single canonical entry with `servers: [...]`.
  *
- * - The proxy `server` field is intentionally excluded from the hash — the
- *   whole point is to merge across hosts.
+ * Dedup key:
+ *   `sha256(full_name_minus_server_prefix + "\n" + stripped_description + "\n" + canonical(annotations) [+ "\n" + canonical(inputSchema)])`
+ *
+ * Key semantics (changed in v1.6.3):
+ *
+ * - The FULL tool name (mount prefix preserved) participates in the hash.
+ *   `dell__read_files` and `hetzner_at_slash__read_files` are DIFFERENT
+ *   filesystems — they must stay as distinct entries. v1.6.1..v1.6.2 used a
+ *   suffix-only key which collapsed N physically distinct mounts into one
+ *   canonical row, hiding mount identity. v1.6.3 corrects this — only fold
+ *   the case it was always meant to fold: the same mount exposed via multiple
+ *   proxy gateways.
+ * - A leading `server:` routing prefix (e.g. `utils:dell__read_files`) is
+ *   stripped before hashing so the same tool seen via different call paths
+ *   still collapses.
+ * - The proxy `server` field remains OUT of the hash — that's what lets the
+ *   same mount seen via utils/thinkpad/pi gateways still collapse to one row.
  * - Description `[nested_server_id] ` prefix is stripped before hashing AND
- *   on the collapsed canonical entry (since `servers: [...]` already
- *   preserves attribution).
- * - Singletons (groups of one) are emitted unchanged — no description rewrite,
- *   no schema mutation.
- * - Groups with 2 members emit a console.warn: dedup expected fleet-scale
- *   duplication, so a small group hints the description-prefix heuristic
- *   may be drifting (per RESEARCH §9 risk #1).
+ *   on the collapsed canonical entry (since `servers: [...]` preserves
+ *   proxy-gateway attribution).
+ * - Singletons (groups of one) emit unchanged.
  * - Non-object array entries pass through unchanged.
+ *
+ * The v1.6.1 "small-group-of-2" warn is removed: the prefix-strip drift it
+ * watched for applied only to the over-eager suffix-only key. With
+ * mount-qualified keys, groups of size N are expected whenever a mount is
+ * reachable from N proxy gateways — a legitimate topology, not a drift signal.
  */
 export function dedupTools(tools: unknown[], opts: DedupOptions = {}): unknown[] {
   if (!Array.isArray(tools) || tools.length === 0) return tools;
   const includeSchema = opts.includeSchema !== false;
-  const warn = opts.onWarn ?? ((m: string) => console.warn(m));
+  void opts.onWarn; // reserved for future drift signals; no current use
 
   type Group = { canonical: ProxyTool; servers: string[]; members: ProxyTool[]; passthru: boolean };
   const groups = new Map<string, Group>();
@@ -242,11 +257,14 @@ export function dedupTools(tools: unknown[], opts: DedupOptions = {}): unknown[]
       continue;
     }
     const tool = t as ProxyTool;
-    const suffix = nameSuffix(tool.name ?? "");
+    const rawName = tool.name ?? "";
+    // Strip only the leading `server:` routing prefix; keep the mount-qualified
+    // name so different mounts produce different keys.
+    const dedupName = rawName.includes(":") ? rawName.split(":").slice(1).join(":") : rawName;
     const desc = strippedDescription(tool.description);
     const annotations = canonicalJson(tool.annotations ?? {});
     const schema = includeSchema && tool.inputSchema ? canonicalJson(tool.inputSchema) : "";
-    const key = sha256Hex(suffix + "\n" + desc + "\n" + annotations + (schema ? "\n" + schema : ""));
+    const key = sha256Hex(dedupName + "\n" + desc + "\n" + annotations + (schema ? "\n" + schema : ""));
 
     const existing = groups.get(key);
     const serverName = typeof tool.server === "string" ? tool.server : "";
@@ -274,9 +292,6 @@ export function dedupTools(tools: unknown[], opts: DedupOptions = {}): unknown[]
     if (g.members.length === 1) {
       out.push(g.canonical);
       continue;
-    }
-    if (g.members.length === 2) {
-      warn(`[mcp-shim/dedup] small group (2) for suffix=${nameSuffix(g.canonical.name ?? "")} — prefix-strip heuristic may be drifting`);
     }
     const merged: Record<string, unknown> = {
       ...g.canonical,

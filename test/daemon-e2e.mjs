@@ -223,12 +223,25 @@ const MOCK_BASE_TOOLS = [
   },
 ];
 
-// v1.6.1 shim-trim fixtures — 10 byte-identical fs-mcp duplicates across hosts.
-// Used to exercise M1 dedup + M2 compact end-to-end through the daemon.
-const FLEET_HOSTS = [
+// v1.6.3 shim-trim fixtures — two-axis fleet model.
+//
+// Axis 1 — DISTINCT MOUNTS (on the same proxy gateway): 10 different
+// fs-mcp mounts each with a distinct mount-qualified tool name. Under
+// v1.6.3 they represent 10 different filesystems and MUST NOT fold, even
+// though their fs-mcp schemas are byte-identical. (v1.6.1..v1.6.2 used
+// suffix-only dedup keying which collapsed these; v1.6.3 preserves mount
+// identity by hashing the full tool name.)
+//
+// Axis 2 — SHARED MOUNT (same mount-qualified name, seen via multiple
+// proxy gateways): one logical mount reachable from 3 proxy gateways.
+// These MUST fold into a single canonical entry with `servers: [...]`
+// — that's the legitimate dedup case v1.6.3 still catches.
+const DISTINCT_MOUNTS = [
   "alpha_at_slash", "bravo_at_slash", "charlie_at_slash", "delta_at_slash", "echo_at_slash",
   "foxtrot_at_slash", "golf_at_slash", "hotel_at_slash", "india_at_slash", "juliet_at_slash",
 ];
+const SHARED_MOUNT_NAME = "shared_at_slash__read_files";
+const SHARED_MOUNT_GATEWAYS = ["utils", "thinkpad", "pi"];
 const FLEET_DESCRIPTION_BODY =
   "Read the contents of multiple files simultaneously. " +
   "This is the canonical fs-mcp tool description that ships byte-identical across all fleet hosts.";
@@ -272,10 +285,13 @@ const FLEET_INPUTSCHEMA = {
   },
   required: ["files"],
 };
-const FLEET_TOOLS = FLEET_HOSTS.map((host) => ({
-  server: host,
-  name: `${host}__read_files`,
-  description: `[${host}] ${FLEET_DESCRIPTION_BODY}`,
+// DISTINCT_MOUNT_TOOLS — 10 different mounts on the same gateway. v1.6.3
+// must keep these as 10 separate entries; their full names differ so the
+// mount-qualified dedup key differs.
+const DISTINCT_MOUNT_TOOLS = DISTINCT_MOUNTS.map((mount) => ({
+  server: "utils",
+  name: `${mount}__read_files`,
+  description: `[${mount}] ${FLEET_DESCRIPTION_BODY}`,
   inputSchema: FLEET_INPUTSCHEMA,
   annotations: { destructiveHint: true, openWorldHint: true, readOnlyHint: false },
   call_with: "call_tool_destructive",
@@ -283,7 +299,21 @@ const FLEET_TOOLS = FLEET_HOSTS.map((host) => ({
   _meta: { "anthropic/maxResultSizeChars": 500000 },
 }));
 
-const MOCK_TOOLS = [...MOCK_BASE_TOOLS, ...FLEET_TOOLS];
+// SHARED_MOUNT_TOOLS — one logical mount (same name) reachable from 3 proxy
+// gateways. v1.6.3 must fold these into one canonical entry with
+// `servers: [utils, thinkpad, pi]`.
+const SHARED_MOUNT_TOOLS = SHARED_MOUNT_GATEWAYS.map((gateway) => ({
+  server: gateway,
+  name: SHARED_MOUNT_NAME,
+  description: `[${SHARED_MOUNT_NAME.split("__")[0]}] ${FLEET_DESCRIPTION_BODY}`,
+  inputSchema: FLEET_INPUTSCHEMA,
+  annotations: { destructiveHint: true, openWorldHint: true, readOnlyHint: false },
+  call_with: "call_tool_destructive",
+  score: 10.5,
+  _meta: { "anthropic/maxResultSizeChars": 500000 },
+}));
+
+const MOCK_TOOLS = [...MOCK_BASE_TOOLS, ...DISTINCT_MOUNT_TOOLS, ...SHARED_MOUNT_TOOLS];
 
 function mockJsonRpcResponse(id, result) {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
@@ -1004,35 +1034,53 @@ async function runTests() {
   // v1.6.1 shim-trim middleware tests (M1 dedup + M2 compact)
   // ----------------------------------------------------------------------
 
-  console.log("\nTest: POST /retrieve_tools (M1 dedup folds host duplicates)");
+  console.log("\nTest: POST /retrieve_tools (M1 dedup respects mount identity — v1.6.3)");
   {
     const r = await request("POST", "/retrieve_tools", { query: "read_files" });
     assert("status 200", r.status === 200, `got: ${r.status}`);
     const tools = r.body?.tools || (Array.isArray(r.body) ? r.body : []);
-    const fleetEntries = tools.filter((t) => (t?.name || "").endsWith("__read_files"));
+    const readFilesEntries = tools.filter((t) => (t?.name || "").endsWith("__read_files"));
+
+    // v1.6.3 MUST preserve mount identity: each distinct mount stays as its own entry.
+    const distinctEntries = readFilesEntries.filter((t) => t?.name !== SHARED_MOUNT_NAME);
     assert(
-      "10 host duplicates fold into 1 canonical entry",
-      fleetEntries.length === 1,
-      `got ${fleetEntries.length}: ${fleetEntries.map((t) => t.name).join(", ")}`,
+      "10 distinct mounts remain as 10 separate entries (mount identity preserved)",
+      distinctEntries.length === 10,
+      `got ${distinctEntries.length}: ${distinctEntries.map((t) => t.name).join(", ")}`,
     );
-    const canonical = fleetEntries[0];
     assert(
-      "canonical entry has servers[] of length 10",
-      Array.isArray(canonical?.servers) && canonical.servers.length === 10,
+      "distinct-mount entries keep 'server' singleton (not folded)",
+      distinctEntries.every((t) => typeof t.server === "string" && !Array.isArray(t.servers)),
+      `sample: ${JSON.stringify(distinctEntries[0]).slice(0, 200)}`,
+    );
+
+    // v1.6.3 MUST still fold same mount across multiple proxy gateways.
+    const shared = readFilesEntries.filter((t) => t?.name === SHARED_MOUNT_NAME);
+    assert(
+      "shared mount across 3 gateways folds into 1 canonical entry",
+      shared.length === 1,
+      `got ${shared.length}`,
+    );
+    const canonical = shared[0];
+    assert(
+      "canonical entry has servers[] of length 3",
+      Array.isArray(canonical?.servers) && canonical.servers.length === 3,
       `got: ${JSON.stringify(canonical?.servers)}`,
     );
     assert(
-      "servers[] contains alpha_at_slash + juliet_at_slash",
-      canonical?.servers?.includes("alpha_at_slash") && canonical?.servers?.includes("juliet_at_slash"),
+      "servers[] contains utils + thinkpad + pi",
+      canonical?.servers?.includes("utils") &&
+        canonical?.servers?.includes("thinkpad") &&
+        canonical?.servers?.includes("pi"),
       `got: ${JSON.stringify(canonical?.servers)}`,
     );
     assert(
-      "singleton 'server' field removed on collapse",
+      "singleton 'server' field removed on fold",
       canonical?.server === undefined,
       `got: ${canonical?.server}`,
     );
     assert(
-      "description prefix '[host] ' stripped on collapse",
+      "description prefix '[mount] ' stripped on fold",
       typeof canonical?.description === "string" && !canonical.description.startsWith("["),
       `got: ${(canonical?.description || "").slice(0, 80)}`,
     );
@@ -1097,16 +1145,26 @@ async function runTests() {
       const altR = await requestPort(DAEMON_PORT + 1, "POST", "/retrieve_tools", { query: "read_files" });
       assert("status 200 (alt daemon)", altR.status === 200, `got: ${altR.status}`);
       const altTools = altR.body?.tools || (Array.isArray(altR.body) ? altR.body : []);
-      const altFleet = altTools.filter((t) => (t?.name || "").endsWith("__read_files"));
+      const altReadFiles = altTools.filter((t) => (t?.name || "").endsWith("__read_files"));
+
+      // With dedup OFF, the shared-mount entries that v1.6.3 normally folds
+      // stay as 3 separate entries alongside the 10 distinct-mount entries.
+      const altDistinct = altReadFiles.filter((t) => t?.name !== SHARED_MOUNT_NAME);
+      const altShared = altReadFiles.filter((t) => t?.name === SHARED_MOUNT_NAME);
       assert(
-        "dedup OFF → all 10 host entries returned individually",
-        altFleet.length === 10,
-        `got ${altFleet.length}`,
+        "dedup OFF → 10 distinct-mount entries returned individually",
+        altDistinct.length === 10,
+        `got ${altDistinct.length}`,
       );
       assert(
-        "dedup OFF → entries keep 'server' singleton, no 'servers' array",
-        altFleet.every((t) => typeof t.server === "string" && !Array.isArray(t.servers)),
-        `sample: ${JSON.stringify(altFleet[0]).slice(0, 200)}`,
+        "dedup OFF → shared-mount entries NOT folded (3 separate rows, one per gateway)",
+        altShared.length === 3,
+        `got ${altShared.length}`,
+      );
+      assert(
+        "dedup OFF → all entries keep 'server' singleton, no 'servers' array",
+        altReadFiles.every((t) => typeof t.server === "string" && !Array.isArray(t.servers)),
+        `sample: ${JSON.stringify(altReadFiles[0]).slice(0, 200)}`,
       );
 
       const altDescribe = await requestPort(DAEMON_PORT + 1, "POST", "/describe_tools", {
@@ -1142,10 +1200,15 @@ async function runTests() {
     const r = await request("POST", "/retrieve_tools", { query: "read_files", limit: 5 });
     assert("status 200", r.status === 200, `got: ${r.status}`);
     const tools = r.body?.tools || (Array.isArray(r.body) ? r.body : []);
+    // Shim-local entries (proxy_admin + describe_tools) are prepended AFTER
+    // compactRetrieveTools slices; they sit outside the user's limit budget.
+    const nonShimLocal = tools.filter(
+      (t) => t?.name !== "proxy_admin" && t?.name !== "describe_tools",
+    );
     assert(
-      "returns up to 5 entries (user's limit respected after dedup)",
-      tools.length > 0 && tools.length <= 5,
-      `got ${tools.length}`,
+      "fleet slice respects user's limit after dedup (<= 5)",
+      nonShimLocal.length > 0 && nonShimLocal.length <= 5,
+      `got ${nonShimLocal.length}`,
     );
     const retrieveCalls = mockUpstreamCalls.filter((c) => typeof c.limit === "number");
     const lastUpstreamCall = retrieveCalls[retrieveCalls.length - 1];
