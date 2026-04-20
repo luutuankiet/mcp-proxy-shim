@@ -643,10 +643,18 @@ async function handleCallTool(
       }
       result = (resp as any).result ?? resp;
     } else {
-      // Stdio transport — SDK client works fine
-      result = await client!.callTool({
-        name: toolName,
-        arguments: toolArgs,
+      // Stdio transport. Use the low-level Protocol.request() instead of
+      // Client.callTool() — callTool() adds a strict outputSchema check on
+      // structuredContent (packages/client/src/client/client.ts:893) that
+      // rejects servers decorating responses with extra keys (fs-mcp injects
+      // `cwd`, others inject tracing/context). The shim is a passthrough;
+      // schema enforcement is the final consumer's concern. request() runs
+      // the same JSON-RPC + base CallToolResultSchema shape check, which
+      // declares structuredContent as `z.record(z.string(), z.unknown())` —
+      // no extra-key rejection.
+      result = await client!.request({
+        method: "tools/call",
+        params: { name: toolName, arguments: toolArgs },
       });
     }
 

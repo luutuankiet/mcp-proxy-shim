@@ -19,6 +19,8 @@ The `publish.yml` workflow reads `releases/${{ github.ref_name }}.md` via `gh re
 
 | Version | Date | Theme |
 |---|---|---|
+| [v1.6.4](./v1.6.4.md) | 2026-04-20 | Passthru uses `Protocol.request()` — skips strict tool-output-schema validation; unblocks decorated servers like fs-mcp v2.0.x |
+| [v1.6.1](./v1.6.1.md) | 2026-04-14 | Shim-trim middleware: dedup + cruft-strip kill schema token bleed at discovery time |
 | [v1.5.0](./v1.5.0.md) | 2026-04-11 | Overflow-to-file bypass for daemon REST mode |
 
 *Earlier releases predate this pattern — see [GitHub Releases](https://github.com/luutuankiet/mcp-proxy-shim/releases) for auto-generated changelogs.*
