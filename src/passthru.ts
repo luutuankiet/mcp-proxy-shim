@@ -52,6 +52,7 @@ import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 // SSE legacy transport removed — only stdio and HTTP Streamable supported.
 // (Streamable HTTP responses may still use SSE format internally — handled in rawMcpRequest.)
 
@@ -652,10 +653,13 @@ async function handleCallTool(
       // the same JSON-RPC + base CallToolResultSchema shape check, which
       // declares structuredContent as `z.record(z.string(), z.unknown())` —
       // no extra-key rejection.
-      result = await client!.request({
-        method: "tools/call",
-        params: { name: toolName, arguments: toolArgs },
-      });
+      result = await client!.request(
+        {
+          method: "tools/call",
+          params: { name: toolName, arguments: toolArgs },
+        },
+        CallToolResultSchema,
+      );
     }
 
     const unwrapped = deepUnwrapResult(result);
