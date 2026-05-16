@@ -173,6 +173,73 @@ export function log(...args: unknown[]) {
   console.error("[mcp-shim]", ...args);
 }
 
+// ---------------------------------------------------------------------------
+// Parent-orphan watchdog (v1.6.5)
+//
+// mcpproxy-go orphans its old shim child on upstream reconnect by abandoning
+// the stdio pipes WITHOUT closing them — so stdin never sees EOF and the shim
+// would hang forever waiting on a parent that no longer talks. Empirically
+// confirmed via lsof: orphaned shims' stdin pipe write-end stays held by
+// mcpproxy, so 'end' / 'close' / EPIPE never fire.
+//
+// Defense: track time since last inbound request. mcpproxy hammers a live
+// shim with ~3 tools/list per second per upstream (verified: 70515 inbounds
+// over the log window), so a healthy shim sees ~1800 requests / 10 minutes.
+// An orphaned shim sees zero. Threshold-cross is binary → safe to self-exit.
+//
+// Opt-out: MCP_SHIM_IDLE_TIMEOUT_SEC=0
+// Default: 600 (10 minutes)
+// ---------------------------------------------------------------------------
+
+let lastInboundAt = Date.now();
+
+/** Call from every inbound request handler to keep the watchdog quiet. */
+export function bumpInboundActivity(): void {
+  lastInboundAt = Date.now();
+}
+
+/**
+ * Start the idle watchdog. Exits with code 0 if no inbound request is
+ * observed within `timeoutSec`. Pass 0 to disable.
+ *
+ * Safe to call multiple times — last call wins.
+ */
+let watchdogTimer: NodeJS.Timeout | null = null;
+export function startIdleWatchdog(timeoutSec: number): void {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+  if (timeoutSec <= 0) {
+    log("Idle watchdog disabled (MCP_SHIM_IDLE_TIMEOUT_SEC=0)");
+    return;
+  }
+  const timeoutMs = timeoutSec * 1000;
+  // Reset reference point — we're "live as of now".
+  lastInboundAt = Date.now();
+  // Check at 1/6 the threshold (every ~100s for default 10min) — cheap enough,
+  // bounds worst-case lag between true-orphan and exit to ~timeoutSec * 7/6.
+  // Floor of 1s keeps short test thresholds responsive without spamming the
+  // event loop at production defaults.
+  const checkIntervalMs = Math.max(1_000, Math.floor(timeoutMs / 6));
+  watchdogTimer = setInterval(() => {
+    const idleMs = Date.now() - lastInboundAt;
+    if (idleMs > timeoutMs) {
+      log(
+        `No inbound request for ${Math.round(idleMs / 1000)}s ` +
+          `(threshold ${timeoutSec}s) — assuming orphaned, shim exiting`,
+      );
+      process.exit(0);
+    }
+  }, checkIntervalMs);
+  // Don't keep the event loop alive solely for the watchdog.
+  watchdogTimer.unref();
+  log(
+    `Idle watchdog armed: exit after ${timeoutSec}s without inbound activity ` +
+      `(check every ${Math.round(checkIntervalMs / 1000)}s)`,
+  );
+}
+
 /** Mask credentials in log output */
 export function maskUrl(url: string) {
   return url.replace(/apikey=[^&\s]+/gi, "apikey=***").replace(/\/\/[^@]*@/, "//***@");
@@ -1165,6 +1232,7 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
 
   // Handle tools/list
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    bumpInboundActivity();
     try {
       cachedTools = await fetchUpstreamTools();
     } catch (err) {
@@ -1183,6 +1251,7 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
 
   // Handle tools/call
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    bumpInboundActivity();
     const { name, arguments: args } = request.params;
 
     // --- Shim-local: describe_tools ---
