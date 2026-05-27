@@ -67,6 +67,30 @@ const CALL_TOOL_NAMES = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
+// /all mode (lean passthrough)
+// ---------------------------------------------------------------------------
+// mcpproxy-go's /mcp/all endpoint exposes a flat list of every upstream tool
+// (named <server>__<tool>) with FULL inputSchemas — no call_tool_* dispatcher
+// wrapping. In this mode the shim becomes a thin forwarder:
+//   - args_json/args transforms are natural no-ops (no call_tool_* tools exist)
+//   - shim-local describe_tools is unnecessary (upstream schemas are already full)
+//   - shim-local proxy_admin is unreachable (mcpproxy admin lives at /api/v1)
+//   - BM25 retrieve_tools wrap is unnecessary (clients already see every tool)
+//
+// Detection (any of):
+//   - MCP_ALL_MODE=1 env var (set by --all CLI flag in index.ts)
+//   - UPSTREAM_URL path ends in /mcp/all or /all
+export const ALL_MODE = (() => {
+  if (process.env.MCP_ALL_MODE === "1") return true;
+  try {
+    const path = new URL(UPSTREAM_URL).pathname;
+    return path === "/mcp/all" || path.endsWith("/mcp/all") || path === "/all" || path.endsWith("/all");
+  } catch {
+    return false;
+  }
+})();
+
+// ---------------------------------------------------------------------------
 // Shim-local tools (not forwarded upstream)
 // ---------------------------------------------------------------------------
 
@@ -1240,6 +1264,11 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
       if (!cachedTools) throw err;
     }
 
+    // /all mode: passthrough only — upstream tools have full schemas, no shim-local injection needed
+    if (ALL_MODE) {
+      return { tools: cachedTools.map(transformToolSchema) };
+    }
+
     return {
       tools: [
         ...cachedTools.map(transformToolSchema),
@@ -1254,8 +1283,8 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
     bumpInboundActivity();
     const { name, arguments: args } = request.params;
 
-    // --- Shim-local: describe_tools ---
-    if (name === "describe_tools") {
+    // --- Shim-local: describe_tools (skipped in /all mode — schemas already full) ---
+    if (!ALL_MODE && name === "describe_tools") {
       const names = (args?.names ?? []) as string[];
       if (!Array.isArray(names) || names.length === 0) {
         return {
@@ -1340,7 +1369,7 @@ export async function createShimServer(options: ShimServerOptions = {}): Promise
     }
 
     // --- Shim-local: proxy_admin ---
-    if (name === "proxy_admin") {
+    if (!ALL_MODE && name === "proxy_admin") {
       const operation = (args?.operation ?? "") as string;
       const serverName = (args?.server_name ?? "") as string;
       const lines = (args?.lines ?? 50) as number;

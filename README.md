@@ -338,6 +338,39 @@ Params use `name: type` format with `*` for required fields. Use `/tools/:name` 
 | `MCP_PORT` | `3456` | Port to listen on |
 | `MCP_HOST` | `0.0.0.0` | Host to bind to |
 
+### Option E: `--all` Mode (lean passthrough for `/mcp/all`)
+
+When pointed at mcpproxy-go's `/mcp/all` endpoint, the shim drops its BM25/dispatcher wrapping and forwards the upstream's native flat tool list verbatim.
+
+**Use case:** you want every upstream tool surfaced directly with its real `inputSchema` (no `args_json`, no `call_tool_*` indirection, no shim-local `describe_tools`/`proxy_admin`). Trade-off: the tool list is frozen at connect time (see *Why Not `/mcp/all`?* below).
+
+```bash
+# Explicit flag
+MCP_URL="https://proxy.example.com/mcp/all?apikey=KEY" npx @luutuankiet/mcp-proxy-shim --all
+
+# Auto-detected (URL path ending in /mcp/all or /all)
+MCP_URL="https://proxy.example.com/mcp/all?apikey=KEY" npx @luutuankiet/mcp-proxy-shim
+
+# Env-var equivalent
+MCP_URL="..." MCP_ALL_MODE=1 npx @luutuankiet/mcp-proxy-shim
+```
+
+What changes in `--all`:
+
+| Behavior | Default (`/mcp/`) | `--all` (`/mcp/all`) |
+|---|---|---|
+| Upstream schema | `call_tool_*` dispatchers with `args_json: string` | Flat `<server>__<tool>` with native `inputSchema` |
+| `args_json` ⇄ `args` schema transform | Active (3 dispatcher tools) | No-op (no dispatchers exist) |
+| Shim-local `describe_tools` | Injected | Skipped (upstream schemas already full) |
+| Shim-local `proxy_admin` | Injected | Skipped (admin lives at `/api/v1`, not `/mcp/all`) |
+| BM25 `retrieve_tools` over-request | Active | Skipped (every tool already visible) |
+| Response-size annotation (`MCP_MAX_RESULT_CHARS`) | Active | Active |
+| Dynamic tool discovery without reconnect | ✅ | ❌ (mcpproxy-go limitation) |
+
+The `passthru` subcommand is **unchanged** and unrelated — that's a generic MCP→REST bridge for arbitrary upstream servers, not a mode of the mcpproxy-go shim.
+
+> ⚠️ **Sensitive URL handling.** `MCP_URL` typically contains an `apikey` query parameter. Never paste real URLs into README examples, test fixtures, commit messages, or chat transcripts — use `https://proxy.example.com/mcp/all?apikey=KEY` as the literal placeholder. Run a pre-push sweep on the working tree for `apikey=` to catch leaks.
+
 ## Why Not `/mcp/all`?
 
 mcpproxy-go exposes two routing modes:
@@ -513,6 +546,7 @@ In a **shim chain** (e.g., Claude Code → shim → proxy → inner shim → pro
 | `MCP_HOST` | `0.0.0.0` | HTTP only | Host to bind to |
 | `MCP_APIKEY` | — (open) | HTTP only | API key for downstream clients. When set, requests must include `?apikey=KEY`. Unset = no auth. |
 | `MCP_MAX_RESULT_CHARS` | `500000` | All | `anthropic/maxResultSizeChars` annotation value. Raises Claude Code's response persistence ceiling. Set `0` to disable. |
+| `MCP_ALL_MODE` | unset | All | Set `1` to force lean passthrough (equivalent to `--all` CLI flag). Auto-detected when `MCP_URL` path ends in `/mcp/all` or `/all`. |
 | `https_proxy` / `HTTPS_PROXY` | — | Both | HTTPS proxy (auto-detected via undici ProxyAgent) |
 
 ## Architecture Details

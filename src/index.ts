@@ -34,18 +34,32 @@ if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
  *   { "mcpServers": { "proxy": { "type": "stdio", "command": "npx", "args": ["-y", "@luutuankiet/mcp-proxy-shim"], "env": { "MCP_URL": "..." } } } }
  */
 
-const subcommand = process.argv[2];
+// --all flag: lean passthrough mode for mcpproxy-go /mcp/all endpoint.
+// Strip it from argv so subcommand parsing isn't confused, and propagate via env
+// so all transport modes (stdio/serve/daemon) pick it up uniformly via core.ts.
+if (process.argv.includes("--all")) {
+  process.env.MCP_ALL_MODE = "1";
+}
+const argv = process.argv.filter((a) => a !== "--all");
+const subcommand = argv[2];
 
 // Handle --help before any imports (avoids MCP_URL validation in core.ts)
 if (subcommand === "--help" || subcommand === "-h") {
   console.log("mcp-proxy-shim — MCP proxy with schema transforms");
   console.log("");
-  console.log("Usage: mcp-proxy-shim [serve|daemon]");
+  console.log("Usage: mcp-proxy-shim [serve|daemon|passthru] [--all]");
   console.log("");
   console.log("Subcommands:");
   console.log("  (default)  stdio transport for local MCP clients (requires MCP_URL)");
   console.log("  serve      HTTP Streamable server for remote agents (requires MCP_URL)");
   console.log("  daemon     REST + MCP gateway for curl-based subagents (requires MCP_URL)");
+  console.log("");
+  console.log("Flags:");
+  console.log("  --all         Lean passthrough mode for mcpproxy-go /mcp/all endpoint.");
+  console.log("                Skips shim-local describe_tools/proxy_admin injection and");
+  console.log("                BM25 retrieve_tools wrap — upstream tools are already flat");
+  console.log("                and carry full schemas. Auto-detected when MCP_URL path ends");
+  console.log("                in /mcp/all or /all. Equivalent: MCP_ALL_MODE=1.");
   console.log("");
   console.log("Environment variables (default/serve modes):");
   console.log("  MCP_URL       (required) upstream mcpproxy-go endpoint");
