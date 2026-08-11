@@ -546,6 +546,7 @@ In a **shim chain** (e.g., Claude Code → shim → proxy → inner shim → pro
 | `MCP_HOST` | `0.0.0.0` | HTTP only | Host to bind to |
 | `MCP_APIKEY` | — (open) | HTTP only | API key for downstream clients. When set, requests must include `?apikey=KEY`. Unset = no auth. |
 | `MCP_MAX_RESULT_CHARS` | `500000` | All | `anthropic/maxResultSizeChars` annotation value. Raises Claude Code's response persistence ceiling. Set `0` to disable. |
+| `MCP_SHIM_REQUEST_TIMEOUT_MS` | `0` (disabled) | All | Client-side request deadline in milliseconds. Disabled by default: the upstream proxy owns the deadline via its own `call_tool_timeout`, and aborting here cannot stop remote work — it only discards a result the server is still producing. Set a positive value to re-enable a client-side cap. |
 | `MCP_ALL_MODE` | unset | All | Set `1` to force lean passthrough (equivalent to `--all` CLI flag). Auto-detected when `MCP_URL` path ends in `/mcp/all` or `/all`. |
 | `https_proxy` / `HTTPS_PROXY` | — | Both | HTTPS proxy (auto-detected via undici ProxyAgent) |
 

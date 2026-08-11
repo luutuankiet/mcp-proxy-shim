@@ -143,7 +143,15 @@ async function rawMcpRequest(
     method: "POST",
     headers: reqHeaders,
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120_000),
+    // Disabled by default — see REQUEST_TIMEOUT_MS in core.ts. Opt back in with
+    // MCP_SHIM_REQUEST_TIMEOUT_MS if a client-side cap is genuinely wanted.
+    ...(Number(process.env.MCP_SHIM_REQUEST_TIMEOUT_MS || 0) > 0
+      ? {
+          signal: AbortSignal.timeout(
+            Number(process.env.MCP_SHIM_REQUEST_TIMEOUT_MS),
+          ),
+        }
+      : {}),
   };
   if (proxyDispatcher) {
     fetchOpts.dispatcher = proxyDispatcher;

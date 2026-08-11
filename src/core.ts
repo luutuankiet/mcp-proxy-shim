@@ -34,7 +34,20 @@ export const UPSTREAM_URL = process.env.MCP_URL ?? (() => {
   process.exit(1);
 })() as never;
 
-export const REQUEST_TIMEOUT_MS = 120_000;
+// Client-side request deadline. Default: DISABLED (0).
+//
+// The upstream mcpproxy owns the deadline via its `call_tool_timeout` setting,
+// and mcpproxy-go >= v0.54.1 exempts MCP routes from the HTTP write deadline
+// so long tool calls stream to completion. A client-side abort here cannot stop
+// the remote work — it only destroys a result the server is still producing,
+// forcing the caller to re-run a command that already ran.
+//
+// Set MCP_SHIM_REQUEST_TIMEOUT_MS to a positive number of milliseconds to
+// re-enable a client-side cap (diagnostics, or an upstream with no deadline).
+export const REQUEST_TIMEOUT_MS = parseInt(
+  process.env.MCP_SHIM_REQUEST_TIMEOUT_MS || "0",
+  10,
+);
 export const MAX_RETRIES = 2;
 
 // Response size annotation — raises Claude Code's persistence ceiling.
@@ -371,7 +384,9 @@ export async function mcpRequest(
         method: "POST",
         headers,
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        ...(REQUEST_TIMEOUT_MS > 0
+          ? { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+          : {}),
       };
       if (proxyDispatcher) {
         fetchOpts.dispatcher = proxyDispatcher;
@@ -405,6 +420,16 @@ export async function mcpRequest(
       return (await resp.json()) as JsonRpcResponse;
     } catch (err) {
       lastError = err as Error;
+      // Never retry an abort/timeout. The upstream request is still executing —
+      // a retry re-sends it, so a non-idempotent tool call (build, migration,
+      // push) runs more than once for a single caller invocation.
+      const errName = (err as Error)?.name;
+      if (errName === "TimeoutError" || errName === "AbortError") {
+        log(
+          `Aborted (${errName}) — not retrying; upstream request may still be running`,
+        );
+        break;
+      }
       if (attempt < MAX_RETRIES) {
         const delay = 1000 * 2 ** attempt; // 1s, 2s
         log(`Retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms:`, lastError.message);
