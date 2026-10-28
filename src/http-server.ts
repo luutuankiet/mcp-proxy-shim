@@ -34,7 +34,7 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { createShimServer, log, maskUrl, UPSTREAM_URL } from "./core.js";
+import { createShimServer, hasValidApiKey, log, maskUrl, UPSTREAM_URL } from "./core.js";
 
 const PORT = parseInt(process.env.MCP_PORT || "3000", 10);
 const HOST = process.env.MCP_HOST || "0.0.0.0";
@@ -182,14 +182,14 @@ async function handleMcpRequest(
 async function main() {
   log(`Starting HTTP Streamable server on ${HOST}:${PORT}`);
   log(`Upstream: ${maskUrl(UPSTREAM_URL)}`);
-  log(`Auth: ${APIKEY ? "apikey required (?apikey=...)" : "OPEN (no MCP_APIKEY set)"}`);
+  log(`Auth: ${APIKEY ? "apikey required (?apikey=, X-API-Key or Bearer)" : "OPEN (no MCP_APIKEY set)"}`);
 
   const httpServer = http.createServer((req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     if (url.pathname === "/mcp" || url.pathname === "/mcp/") {
       // Apikey gate — reject early if MCP_APIKEY is set and key doesn't match
-      if (APIKEY && url.searchParams.get("apikey") !== APIKEY) {
+      if (APIKEY && !hasValidApiKey(url, req.headers, APIKEY)) {
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           jsonrpc: "2.0",

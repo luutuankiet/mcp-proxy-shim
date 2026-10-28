@@ -21,6 +21,7 @@ if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
 
 // Proxy support — Node 22 built-in undici honors https_proxy via ProxyAgent
 import { createRequire } from "node:module";
+import { timingSafeEqual } from "node:crypto";
 const _require = createRequire(import.meta.url);
 const { ProxyAgent } = _require("undici") as { ProxyAgent: new (url: string) => object };
 
@@ -275,6 +276,30 @@ export function startIdleWatchdog(timeoutSec: number): void {
     `Idle watchdog armed: exit after ${timeoutSec}s without inbound activity ` +
       `(check every ${Math.round(checkIntervalMs / 1000)}s)`,
   );
+}
+
+/**
+ * Check a client's key against MCP_APIKEY. Accepts, like mcpproxy-go itself,
+ * `?apikey=KEY`, `X-API-Key: KEY` or `Authorization: Bearer KEY`, so clients
+ * that only support headers (e.g. claude.ai custom connectors) can connect.
+ */
+export function hasValidApiKey(
+  url: URL,
+  headers: Record<string, string | string[] | undefined>,
+  expected: string,
+): boolean {
+  const header = (name: string) => {
+    const v = headers[name];
+    return Array.isArray(v) ? v[0] : v;
+  };
+  const bearer = header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+  const candidates = [url.searchParams.get("apikey"), header("x-api-key"), bearer];
+  const want = Buffer.from(expected);
+  return candidates.some((c) => {
+    if (!c) return false;
+    const got = Buffer.from(c.trim());
+    return got.length === want.length && timingSafeEqual(got, want);
+  });
 }
 
 /** Mask credentials in log output */

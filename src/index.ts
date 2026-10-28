@@ -65,14 +65,14 @@ if (subcommand === "--help" || subcommand === "-h") {
   console.log("  MCP_URL       (required) upstream mcpproxy-go endpoint");
   console.log("  MCP_PORT      (serve only) port to listen on (default: 3000)");
   console.log("  MCP_HOST      (serve only) host to bind to (default: 0.0.0.0)");
-  console.log("  MCP_APIKEY    (serve only) require ?apikey=KEY on /mcp requests");
+  console.log("  MCP_APIKEY    (serve only) require KEY on /mcp (?apikey=, X-API-Key or Bearer)");
   console.log("  https_proxy   HTTPS proxy for upstream connection");
   console.log("");
   console.log("Environment variables (daemon mode):");
   console.log("  MCP_URL       (required) upstream mcpproxy-go endpoint");
   console.log("  MCP_PORT      Port to listen on (default: 3456)");
   console.log("  MCP_HOST      Host to bind to (default: 0.0.0.0)");
-  console.log("  MCP_APIKEY    Require ?apikey=KEY on /mcp requests (optional)");
+  console.log("  MCP_APIKEY    Require KEY on /mcp (?apikey=, X-API-Key or Bearer; optional)");
   console.log("");
   console.log("Daemon REST endpoints:");
   console.log("  GET  /health          Health check + session info");

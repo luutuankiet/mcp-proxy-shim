@@ -40,6 +40,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import {
   createShimServer,
+  hasValidApiKey,
   log,
   maskUrl,
   UPSTREAM_URL,
@@ -825,7 +826,7 @@ async function main() {
     );
     const pathname = url.pathname;
 
-    if (APIKEY && url.searchParams.get("apikey") !== APIKEY) {
+    if (APIKEY && !hasValidApiKey(url, req.headers, APIKEY)) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized: invalid or missing apikey" }));
       return;
@@ -888,7 +889,7 @@ async function main() {
     log(`Daemon listening on http://${HOST}:${PORT}`);
     log("REST endpoints: /health, /retrieve_tools, /describe_tools, /call, /exec, /reinit, /proxy_admin");
     log("MCP endpoint: /mcp");
-    log(`Auth: ${APIKEY ? "apikey required (?apikey=...)" : "OPEN (no MCP_APIKEY set)"}`);
+    log(`Auth: ${APIKEY ? "apikey required (?apikey=, X-API-Key or Bearer)" : "OPEN (no MCP_APIKEY set)"}`);
   });
 
   const shutdown = async () => {

@@ -138,6 +138,8 @@ Then point your remote MCP client at:
 http://localhost:3000/mcp?apikey=my-secret
 ```
 
+Clients that can only send headers (for example claude.ai custom connectors) can pass the same key as `X-API-Key: my-secret` or `Authorization: Bearer my-secret` instead of the query parameter.
+
 #### Production deployment with Docker
 
 ```yaml
@@ -194,9 +196,9 @@ Each downstream client gets its own MCP session, but all sessions **share a sing
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/mcp` | POST | `?apikey=` | MCP JSON-RPC (initialize, tool calls) |
-| `/mcp` | GET | `?apikey=` | SSE stream reconnection |
-| `/mcp` | DELETE | `?apikey=` | Session termination |
+| `/mcp` | POST | `?apikey=`, `X-API-Key` or `Bearer` | MCP JSON-RPC (initialize, tool calls) |
+| `/mcp` | GET | same | SSE stream reconnection |
+| `/mcp` | DELETE | same | Session termination |
 | `/health` | GET | None | Health check (session count, uptime) |
 
 ### Option C: Daemon Mode (REST + MCP gateway for cloud agents)
@@ -233,7 +235,7 @@ MCP_URL="https://your-proxy/mcp/?apikey=KEY" npx @luutuankiet/mcp-proxy-shim dae
 | `MCP_URL` | **(required)** | mcpproxy-go StreamableHTTP endpoint |
 | `MCP_PORT` | `3456` | Port to listen on |
 | `MCP_HOST` | `0.0.0.0` | Host to bind to |
-| `MCP_APIKEY` | — (open) | Require `?apikey=KEY` on requests |
+| `MCP_APIKEY` | — (open) | Require KEY on requests, as `?apikey=KEY`, `X-API-Key: KEY` or `Authorization: Bearer KEY` |
 
 ### Option D: Passthru Mode (generic MCP→REST bridge)
 
@@ -544,7 +546,7 @@ In a **shim chain** (e.g., Claude Code → shim → proxy → inner shim → pro
 | `MCP_URL` | **(required)** | Both | mcpproxy-go StreamableHTTP endpoint |
 | `MCP_PORT` | `3000` | HTTP only | Port to listen on |
 | `MCP_HOST` | `0.0.0.0` | HTTP only | Host to bind to |
-| `MCP_APIKEY` | — (open) | HTTP only | API key for downstream clients. When set, requests must include `?apikey=KEY`. Unset = no auth. |
+| `MCP_APIKEY` | — (open) | HTTP only | API key for downstream clients. When set, requests must carry KEY as `?apikey=KEY`, `X-API-Key: KEY` or `Authorization: Bearer KEY`. Unset = no auth. |
 | `MCP_MAX_RESULT_CHARS` | `500000` | All | `anthropic/maxResultSizeChars` annotation value. Raises Claude Code's response persistence ceiling. Set `0` to disable. |
 | `MCP_SHIM_REQUEST_TIMEOUT_MS` | `0` (disabled) | All | Client-side request deadline in milliseconds. Disabled by default: the upstream proxy owns the deadline via its own `call_tool_timeout`, and aborting here cannot stop remote work — it only discards a result the server is still producing. Set a positive value to re-enable a client-side cap. |
 | `MCP_ALL_MODE` | unset | All | Set `1` to force lean passthrough (equivalent to `--all` CLI flag). Auto-detected when `MCP_URL` path ends in `/mcp/all` or `/all`. |
